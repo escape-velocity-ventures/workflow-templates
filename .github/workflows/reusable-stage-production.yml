@@ -1,0 +1,675 @@
+# Reusable Stage-to-Production Workflow
+# Purpose: Deploy an image to the inactive production slot for preview/testing
+# Created: 2026-02-18 to eliminate workflow duplication across app repos
+#
+# Usage in app repos:
+#
+#   jobs:
+#     stage:
+#       uses: escape-velocity-ventures/workflow-templates/.github/workflows/reusable-stage-production.yml@main
+#       with:
+#         app-name: my-app
+#         image-name: escape-velocity-ventures/my-app
+#         image-tag: ${{ github.event.inputs.image_tag }}
+#         skip-validation-check: false
+#         preview-hostname: preview.my-app.example.com
+#         # Optional: Enable staging E2E gate (requires test specs + Playwright config)
+#         # Staging URL is derived from preview-hostname (preview → staging)
+#         e2e-enabled: true
+#         e2e-working-directory: web
+#       secrets: inherit
+
+name: Reusable Stage to Production
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Application name (matches K8s deployment name)'
+        required: true
+        type: string
+      image-name:
+        description: 'Full image name without registry (e.g. escape-velocity-ventures/my-app)'
+        required: true
+        type: string
+      image-tag:
+        description: 'Image tag to deploy. Empty string = auto-detect from staging deployment'
+        required: false
+        type: string
+        default: ''
+      skip-validation-check:
+        description: 'Skip validation registry check (not recommended)'
+        type: boolean
+        default: false
+      preview-hostname:
+        description: 'Hostname for the preview/inactive slot'
+        required: true
+        type: string
+      deployment-name:
+        description: 'K8s deployment name (default: app-name)'
+        type: string
+        default: ''
+      staging-namespace:
+        description: 'Override staging namespace (default: {app-name}-staging)'
+        type: string
+        default: ''
+      production-namespace-prefix:
+        description: 'Override production namespace prefix (default: {app-name}-production)'
+        type: string
+        default: ''
+      bluegreen-key:
+        description: 'ConfigMap key for blue-green state (default: app-name)'
+        type: string
+        default: ''
+      e2e-enabled:
+        description: 'Enable staging E2E tests as a gate before production promotion'
+        type: boolean
+        default: false
+      staging-url:
+        description: 'Staging URL override for E2E tests. If empty, derived from preview-hostname (preview → staging)'
+        type: string
+        default: ''
+      e2e-working-directory:
+        description: 'Working directory for E2E test commands (default: web)'
+        type: string
+        default: 'web'
+    secrets:
+      GH_PAT:
+        required: true
+      KUBECONFIG_STAGING:
+        required: true
+      KUBECONFIG_PRODUCTION:
+        required: true
+      SLACK_WEBHOOK_DEPLOY:
+        required: false
+      STAGING_SUPABASE_URL:
+        required: false
+      STAGING_SUPABASE_SERVICE_ROLE_KEY:
+        required: false
+      STAGING_SUPABASE_ANON_KEY:
+        required: false
+    outputs:
+      target-slot:
+        description: 'The slot that was deployed to (blue or green)'
+        value: ${{ jobs.detect-slot.outputs.target-slot }}
+      resolved-tag:
+        description: 'The resolved immutable image tag that was deployed'
+        value: ${{ jobs.deploy-preview.outputs.resolved-tag }}
+
+jobs:
+  # =============================================================
+  # Resolve Image Tag (auto-detect from staging if not provided)
+  # =============================================================
+  resolve-image:
+    name: Resolve Image Tag
+    runs-on: arc-runner-set
+    outputs:
+      image-tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl (staging)
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Resolve image tag from staging
+        id: resolve
+        run: |
+          INPUT_TAG="${{ inputs.image-tag }}"
+
+          # If an explicit tag is provided and it's not the mutable "staging" tag, use it
+          if [ -n "$INPUT_TAG" ] && [ "$INPUT_TAG" != "staging" ]; then
+            echo "Using provided image tag: $INPUT_TAG"
+            echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # No tag (or "staging") — read the immutable SHA from the running staging deployment
+          DEPLOY_NAME="${{ inputs.deployment-name || inputs.app-name }}"
+          STG_NS="${{ inputs.staging-namespace || format('{0}-staging', inputs.app-name) }}"
+          IMAGE=$(kubectl get deployment $DEPLOY_NAME -n $STG_NS \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+          # Extract the tag (everything after the last colon)
+          TAG="${IMAGE##*:}"
+
+          if [ -z "$TAG" ] || [ "$TAG" = "$IMAGE" ]; then
+            echo "Failed to extract image tag from staging deployment"
+            echo "Image: $IMAGE"
+            exit 1
+          fi
+
+          echo "Resolved image tag from staging: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Resolution Summary
+        run: |
+          echo "## Image Resolution" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ steps.resolve.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Source:** ${{ inputs.image-tag != '' && inputs.image-tag != 'staging' && 'manual input' || 'staging deployment' }}" >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================
+  # Verify Image is Validated
+  # =============================================================
+  verify-image:
+    name: Verify Image Validation
+    runs-on: ubuntu-latest
+    needs: resolve-image
+    outputs:
+      validated: ${{ steps.verify.outputs.validated }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check validation registry
+        id: verify
+        run: |
+          IMAGE_TAG="${{ needs.resolve-image.outputs.image-tag }}"
+
+          if [ "${{ inputs.skip-validation-check }}" = "true" ]; then
+            echo "Skipping validation check (not recommended)"
+            echo "validated=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Registry is keyed by kustomize manifest hash. Image digests stored
+          # inside are platform-specific (from kubelet), which don't match the
+          # manifest list digest from docker inspect on a different arch.
+          # Instead, verify the most recent record passed health checks.
+          if [ -f k8s/.tb-validation/registry.json ]; then
+            LATEST=$(jq -r '
+              [.records | to_entries[] | .value] |
+              sort_by(.deployedAt) | last
+            ' k8s/.tb-validation/registry.json)
+
+            HEALTH_RESULT=$(echo "$LATEST" | jq -r '.healthCheckResult')
+            DEPLOYED_AT=$(echo "$LATEST" | jq -r '.deployedAt')
+            MANIFEST_HASH=$(echo "$LATEST" | jq -r '.hash')
+
+            echo "Latest validated deployment:"
+            echo "  Manifest: ${MANIFEST_HASH:0:12}"
+            echo "  Health: $HEALTH_RESULT"
+            echo "  Deployed: $DEPLOYED_AT"
+
+            if [ "$HEALTH_RESULT" = "passed" ]; then
+              echo "Image validated via staging registry (manifest: ${MANIFEST_HASH:0:12})"
+              echo "validated=true" >> $GITHUB_OUTPUT
+            else
+              echo "Latest staging deployment health: $HEALTH_RESULT"
+              echo "validated=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          else
+            echo "Validation registry not found"
+            echo "validated=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validation Summary
+        run: |
+          echo "## Image Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`ghcr.io/${{ inputs.image-name }}:${{ needs.resolve-image.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Validated:** ${{ steps.verify.outputs.validated }}" >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================
+  # Staging E2E Gate (optional — enabled per product)
+  # =============================================================
+  e2e-staging:
+    name: Staging E2E Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip if E2E not enabled
+        if: ${{ !inputs.e2e-enabled }}
+        run: echo "E2E tests not enabled for this app — skipping"
+
+      - name: Resolve staging URL
+        if: ${{ inputs.e2e-enabled }}
+        id: staging
+        run: |
+          if [ -n "${{ inputs.staging-url }}" ]; then
+            echo "url=${{ inputs.staging-url }}" >> $GITHUB_OUTPUT
+          else
+            # Derive from preview-hostname: {app}-preview.domain → {app}-staging.domain
+            STAGING_HOST=$(echo "${{ inputs.preview-hostname }}" | sed 's/-preview/-staging/')
+            echo "url=https://${STAGING_HOST}" >> $GITHUB_OUTPUT
+            echo "Derived staging URL from preview-hostname: https://${STAGING_HOST}"
+          fi
+
+      - name: Checkout code
+        if: ${{ inputs.e2e-enabled }}
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        if: ${{ inputs.e2e-enabled }}
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: 1.1.38
+          no-cache: true
+
+      - name: Install dependencies
+        if: ${{ inputs.e2e-enabled }}
+        working-directory: ${{ inputs.e2e-working-directory }}
+        run: bun install
+
+      - name: Install Playwright browsers
+        if: ${{ inputs.e2e-enabled }}
+        working-directory: ${{ inputs.e2e-working-directory }}
+        run: bunx playwright install chromium --with-deps
+
+      - name: Wait for staging to be healthy
+        if: ${{ inputs.e2e-enabled }}
+        run: |
+          STAGING_URL="${{ steps.staging.outputs.url }}"
+          echo "Verifying staging is live before E2E... ($STAGING_URL)"
+          for i in $(seq 1 30); do
+            if curl -sf "$STAGING_URL" -o /dev/null; then
+              echo "Staging is healthy after $i attempts"
+              exit 0
+            fi
+            echo "Attempt $i/30 — waiting 10s..."
+            sleep 10
+          done
+          echo "Staging did not become healthy in time"
+          exit 1
+
+      - name: Run staging E2E tests
+        if: ${{ inputs.e2e-enabled }}
+        working-directory: ${{ inputs.e2e-working-directory }}
+        run: bun run test:e2e:staging
+        env:
+          STAGING_URL: ${{ steps.staging.outputs.url }}
+          STAGING_SUPABASE_URL: ${{ secrets.STAGING_SUPABASE_URL }}
+          STAGING_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.STAGING_SUPABASE_SERVICE_ROLE_KEY }}
+          STAGING_SUPABASE_ANON_KEY: ${{ secrets.STAGING_SUPABASE_ANON_KEY }}
+
+      - name: Upload staging test report
+        if: ${{ always() && inputs.e2e-enabled }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-staging
+          path: ${{ inputs.e2e-working-directory }}/playwright-report-staging/
+          retention-days: 14
+
+  # =============================================================
+  # Detect Inactive Slot
+  # =============================================================
+  detect-slot:
+    name: Detect Inactive Slot
+    runs-on: arc-runner-set
+    outputs:
+      target-slot: ${{ steps.detect.outputs.slot }}
+      target-namespace: ${{ steps.detect.outputs.namespace }}
+      active-slot: ${{ steps.detect.outputs.active_slot }}
+    steps:
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Detect inactive slot from cluster ConfigMap
+        id: detect
+        run: |
+          BG_KEY="${{ inputs.bluegreen-key || inputs.app-name }}"
+          NS_PREFIX="${{ inputs.production-namespace-prefix || format('{0}-production', inputs.app-name) }}"
+
+          # Read active slot from cluster ConfigMap (source of truth)
+          ACTIVE_SLOT=$(kubectl get configmap bluegreen-state -n infrastructure \
+            -o jsonpath="{.data.${BG_KEY}}" 2>/dev/null || echo "blue")
+
+          if [ -z "$ACTIVE_SLOT" ]; then
+            ACTIVE_SLOT="blue"
+          fi
+
+          echo "Current active slot: $ACTIVE_SLOT"
+
+          # Determine target (inactive) slot
+          if [ "$ACTIVE_SLOT" = "blue" ]; then
+            TARGET_SLOT="green"
+            TARGET_NAMESPACE="${NS_PREFIX}-green"
+          else
+            TARGET_SLOT="blue"
+            TARGET_NAMESPACE="${NS_PREFIX}-blue"
+          fi
+
+          echo "Target slot: $TARGET_SLOT"
+          echo "Target namespace: $TARGET_NAMESPACE"
+
+          echo "slot=$TARGET_SLOT" >> $GITHUB_OUTPUT
+          echo "namespace=$TARGET_NAMESPACE" >> $GITHUB_OUTPUT
+          echo "active_slot=$ACTIVE_SLOT" >> $GITHUB_OUTPUT
+
+      - name: Slot Detection Summary
+        run: |
+          echo "## Slot Detection" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Active Slot:** ${{ steps.detect.outputs.active_slot }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Slot:** ${{ steps.detect.outputs.slot }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Namespace:** ${{ steps.detect.outputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================
+  # Deploy to Inactive Production Slot
+  # =============================================================
+  deploy-preview:
+    name: Deploy to ${{ needs.detect-slot.outputs.target-namespace }}
+    runs-on: arc-runner-set
+    needs: [resolve-image, verify-image, detect-slot, e2e-staging]
+    outputs:
+      resolved-tag: ${{ steps.resolve-tag.outputs.tag }}
+    environment:
+      name: production-preview
+      url: https://${{ inputs.preview-hostname }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Ensure GHCR pull secret exists
+        run: |
+          TARGET_NAMESPACE="${{ needs.detect-slot.outputs.target-namespace }}"
+          kubectl get secret ghcr-pull-secret -n $TARGET_NAMESPACE 2>/dev/null || \
+          kubectl create secret docker-registry ghcr-pull-secret \
+            --namespace=$TARGET_NAMESPACE \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tag
+        id: resolve-tag
+        run: |
+          IMAGE_TAG="${{ needs.resolve-image.outputs.image-tag }}"
+
+          if [ "$IMAGE_TAG" = "staging" ]; then
+            # Resolve mutable :staging tag to the immutable commit SHA
+            # by reading the actual image tag from the staging deployment
+            DEPLOY_NAME="${{ inputs.deployment-name || inputs.app-name }}"
+            STG_NS="${{ inputs.staging-namespace || format('{0}-staging', inputs.app-name) }}"
+            STAGING_IMAGE=$(kubectl get deployment $DEPLOY_NAME -n $STG_NS \
+              -o jsonpath='{.spec.template.spec.containers[0].image}')
+            RESOLVED_TAG="${STAGING_IMAGE##*:}"
+
+            echo "Resolved mutable tag ':staging' → ':${RESOLVED_TAG}' (from staging deployment)"
+            echo "tag=${RESOLVED_TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "Using explicit tag: ${IMAGE_TAG}"
+            echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update image in kustomization
+        run: |
+          TARGET_SLOT="${{ needs.detect-slot.outputs.target-slot }}"
+          RESOLVED_TAG="${{ steps.resolve-tag.outputs.tag }}"
+
+          # Use the slot-specific kustomization
+          cd k8s/production-${TARGET_SLOT}/app-only
+
+          if ! command -v kustomize &> /dev/null; then
+            curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+            sudo mv kustomize /usr/local/bin/
+          fi
+
+          echo "Setting image to ghcr.io/${{ inputs.image-name }}:${RESOLVED_TAG}"
+          kustomize edit set image ghcr.io/${{ inputs.image-name }}:${RESOLVED_TAG}
+
+      - name: Deploy to inactive slot
+        run: |
+          TARGET_SLOT="${{ needs.detect-slot.outputs.target-slot }}"
+          TARGET_NAMESPACE="${{ needs.detect-slot.outputs.target-namespace }}"
+
+          echo "Deploying to $TARGET_NAMESPACE (slot: $TARGET_SLOT)..."
+
+          # Build and apply manifests directly
+          # Use server-side apply with force-conflicts to handle selector changes
+          cd ${{ github.workspace }}/k8s/production-${TARGET_SLOT}/app-only
+          kustomize build . | kubectl apply --server-side --force-conflicts -n $TARGET_NAMESPACE -f -
+
+      - name: Wait for rollout
+        env:
+          DEPLOY_NAME: ${{ inputs.deployment-name || inputs.app-name }}
+        run: |
+          TARGET_NAMESPACE="${{ needs.detect-slot.outputs.target-namespace }}"
+          kubectl rollout status deployment/$DEPLOY_NAME -n $TARGET_NAMESPACE --timeout=120s
+
+      - name: Verify pods
+        env:
+          DEPLOY_NAME: ${{ inputs.deployment-name || inputs.app-name }}
+        run: |
+          TARGET_NAMESPACE="${{ needs.detect-slot.outputs.target-namespace }}"
+          kubectl get pods -n $TARGET_NAMESPACE -l app.kubernetes.io/name=$DEPLOY_NAME
+
+          # Check deployment replica counts directly instead of kubectl wait,
+          # which matches terminating pods during rolling updates and false-fails
+          READY=$(kubectl get deployment $DEPLOY_NAME -n $TARGET_NAMESPACE \
+            -o jsonpath='{.status.readyReplicas}')
+          DESIRED=$(kubectl get deployment $DEPLOY_NAME -n $TARGET_NAMESPACE \
+            -o jsonpath='{.spec.replicas}')
+
+          if [ "$READY" = "$DESIRED" ] && [ "$READY" -gt 0 ]; then
+            echo "All $READY/$DESIRED pods are ready"
+          else
+            echo "Only ${READY:-0}/$DESIRED pods ready"
+            exit 1
+          fi
+
+  # =============================================================
+  # Run Prevalidation Checks
+  # =============================================================
+  prevalidation:
+    name: Prevalidation
+    runs-on: arc-runner-set
+    needs: [detect-slot, deploy-preview]
+    steps:
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Verify pods are running
+        env:
+          DEPLOY_NAME: ${{ inputs.deployment-name || inputs.app-name }}
+        run: |
+          TARGET_NAMESPACE="${{ needs.detect-slot.outputs.target-namespace }}"
+          echo "Verifying pods in $TARGET_NAMESPACE..."
+
+          # Check deployment status
+          kubectl get deployment $DEPLOY_NAME -n $TARGET_NAMESPACE
+          kubectl rollout status deployment/$DEPLOY_NAME -n $TARGET_NAMESPACE --timeout=60s
+
+          # Verify all pods are ready
+          READY=$(kubectl get deployment $DEPLOY_NAME -n $TARGET_NAMESPACE -o jsonpath='{.status.readyReplicas}')
+          DESIRED=$(kubectl get deployment $DEPLOY_NAME -n $TARGET_NAMESPACE -o jsonpath='{.spec.replicas}')
+
+          if [ "$READY" -eq "$DESIRED" ]; then
+            echo "All $READY/$DESIRED pods are ready"
+          else
+            echo "Only $READY/$DESIRED pods are ready"
+            exit 1
+          fi
+
+      - name: Health check via HTTP
+        run: |
+          # Direct health check to preview endpoint (CNAME pointing to inactive slot)
+          PREVIEW_URL="https://${{ inputs.preview-hostname }}"
+
+          echo "Checking $PREVIEW_URL..."
+
+          for i in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PREVIEW_URL" || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Preview endpoint responding (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $HTTP_CODE, retrying..."
+            sleep 5
+          done
+
+          echo "Preview endpoint not responding after 5 attempts"
+          exit 1
+
+      - name: Prevalidation Summary
+        if: always()
+        run: |
+          TARGET_SLOT="${{ needs.detect-slot.outputs.target-slot }}"
+          TARGET_NAMESPACE="${{ needs.detect-slot.outputs.target-namespace }}"
+
+          echo "## Prevalidation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Slot:** $TARGET_SLOT" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace:** $TARGET_NAMESPACE" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://${{ inputs.preview-hostname }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Checks" >> $GITHUB_STEP_SUMMARY
+          echo "- [x] Deployment rolled out successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- [x] Pods are ready" >> $GITHUB_STEP_SUMMARY
+          echo "- [x] Health endpoint responding" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Manually test** the preview deployment at the URL above" >> $GITHUB_STEP_SUMMARY
+          echo "2. Verify critical user flows" >> $GITHUB_STEP_SUMMARY
+          echo "3. Run \`deploy-production\` workflow to cutover live traffic" >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================
+  # Summary
+  # =============================================================
+  summary:
+    name: Stage to Production Summary
+    runs-on: ubuntu-latest
+    needs: [resolve-image, verify-image, detect-slot, e2e-staging, deploy-preview, prevalidation]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Stage to Production" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          RESOLVED="${{ needs.deploy-preview.outputs.resolved-tag }}"
+          INPUT="${{ needs.resolve-image.outputs.image-tag }}"
+          if [ "$RESOLVED" != "$INPUT" ] && [ -n "$RESOLVED" ]; then
+            echo "**Image:** \`ghcr.io/${{ inputs.image-name }}:${RESOLVED}\` (resolved from \`:${INPUT}\`)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Image:** \`ghcr.io/${{ inputs.image-name }}:${INPUT}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Target Slot:** ${{ needs.detect-slot.outputs.target-slot }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Namespace:** ${{ needs.detect-slot.outputs.target-namespace }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Verify Image | ${{ needs.verify-image.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Staging E2E | ${{ needs.e2e-staging.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Detect Slot | ${{ needs.detect-slot.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy to Preview | ${{ needs.deploy-preview.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Prevalidation | ${{ needs.prevalidation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.prevalidation.result }}" = "success" ]; then
+            echo "**Ready for production cutover**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Run the \`deploy-production\` workflow to switch live traffic to this deployment." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Not ready for production**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Review the failed checks and fix issues before proceeding." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # --- Inline Slack Notifications (cross-repo reusable workflows cannot use composite actions) ---
+      - name: Notify Slack - staged to production
+        if: needs.prevalidation.result == 'success'
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
+          echo "::add-mask::$WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          WORKFLOW_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PAYLOAD="{
+            \"attachments\": [{
+              \"color\": \"#9b59b6\",
+              \"blocks\": [
+                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\":eyes: Staged for Production\",\"emoji\":true}},
+                {\"type\":\"section\",\"fields\":[
+                  {\"type\":\"mrkdwn\",\"text\":\"*Repository:*\\n<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\nproduction\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Slot:*\\n${{ needs.detect-slot.outputs.target-slot }}\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Ref:*\\n$GITHUB_REF_NAME ($SHORT_SHA)\"}
+                ]},
+                {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Triggered by $GITHUB_ACTOR | <$WORKFLOW_URL|View Workflow>\"}]}
+              ]
+            }]
+          }"
+          curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" || true
+
+      - name: Notify Slack - staging to production failed
+        if: needs.prevalidation.result != 'success'
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
+          echo "::add-mask::$WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          WORKFLOW_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PAYLOAD="{
+            \"attachments\": [{
+              \"color\": \"#dc3545\",
+              \"blocks\": [
+                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\":x: Deployment Failed\",\"emoji\":true}},
+                {\"type\":\"section\",\"fields\":[
+                  {\"type\":\"mrkdwn\",\"text\":\"*Repository:*\\n<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\nproduction-preview\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Ref:*\\n$GITHUB_REF_NAME ($SHORT_SHA)\"}
+                ]},
+                {\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"*Error:*\\n\`\`\`Prevalidation failed for preview slot\`\`\`\"}},
+                {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Triggered by $GITHUB_ACTOR | <$WORKFLOW_URL|View Workflow>\"}]}
+              ]
+            }]
+          }"
+          curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" || true

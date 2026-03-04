@@ -1,0 +1,179 @@
+# Reusable Container Build Workflow
+# Purpose: Enforce multi-arch builds (linux/amd64,linux/arm64) as default
+# Created: 2026-01-22 as remediation for POST-MORTEM-2026-01-22
+#
+# This reusable workflow ensures all container images are built for both
+# amd64 and arm64 architectures, preventing platform mismatch errors.
+#
+# Usage in other workflows:
+#
+#   jobs:
+#     build:
+#       uses: escape-velocity-ventures/workflow-templates/.github/workflows/reusable-container-build.yml@main
+#       with:
+#         image-name: my-service
+#         context: ./src
+#         dockerfile: ./src/Dockerfile   # path relative to repo root
+#       secrets: inherit
+
+name: Reusable Container Build
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: 'Name of the container image (without registry prefix)'
+        required: true
+        type: string
+      context:
+        description: 'Build context path (default: .)'
+        required: false
+        type: string
+        default: '.'
+      dockerfile:
+        description: 'Path to Dockerfile (default: Dockerfile)'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      platforms:
+        description: 'Target platforms (default: linux/amd64,linux/arm64 - REQUIRED FOR PRODUCTION)'
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
+      push:
+        description: 'Push to registry (default: true for non-PR)'
+        required: false
+        type: boolean
+        default: true
+      registry:
+        description: 'Container registry (default: ghcr.io)'
+        required: false
+        type: string
+        default: 'ghcr.io'
+      registry-org:
+        description: 'Registry organization (default: escape-velocity-ventures)'
+        required: false
+        type: string
+        default: 'escape-velocity-ventures'
+      extra-tags:
+        description: 'Additional tags (newline-separated)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      github-token:
+        description: 'GitHub token for registry authentication (optional — falls back to github.token)'
+        required: false
+
+jobs:
+  validate-platforms:
+    name: Validate Build Configuration
+    runs-on: ubuntu-latest
+    env:
+      FULL_IMAGE_NAME: ${{ inputs.registry }}/${{ inputs.registry-org }}/${{ inputs.image-name }}
+    steps:
+      - name: Check multi-arch requirement
+        run: |
+          PLATFORMS="${{ inputs.platforms }}"
+          echo "## Build Configuration Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if both architectures are included
+          if [[ "$PLATFORMS" == *"amd64"* ]] && [[ "$PLATFORMS" == *"arm64"* ]]; then
+            echo "✅ Multi-arch build configured: $PLATFORMS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ WARNING: Single-arch build detected: $PLATFORMS" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Per POST-MORTEM-2026-01-22, all production containers MUST support both amd64 and arm64." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "If this is intentional (e.g., architecture-specific tooling), document the reason." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ${{ env.FULL_IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Context: ${{ inputs.context }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Dockerfile: ${{ inputs.dockerfile }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Platforms: ${{ inputs.platforms }}" >> $GITHUB_STEP_SUMMARY
+
+  build-and-push:
+    name: Build and Push Container
+    runs-on: ubuntu-latest
+    needs: [validate-platforms]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      FULL_IMAGE_NAME: ${{ inputs.registry }}/${{ inputs.registry-org }}/${{ inputs.image-name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ inputs.platforms }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: inputs.push && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.github-token || github.token }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            ${{ inputs.extra-tags }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push && github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify multi-arch manifest
+        if: inputs.push && github.event_name != 'pull_request'
+        run: |
+          echo "## Image Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Tags Pushed" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Verify manifest includes expected platforms
+          echo "### Platform Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Verifying ${{ env.FULL_IMAGE_NAME }}:latest includes all platforms..." >> $GITHUB_STEP_SUMMARY
+
+          # Note: This verification runs after push, so manifest should be available
+          if docker manifest inspect ${{ env.FULL_IMAGE_NAME }}:latest > /dev/null 2>&1; then
+            echo "✅ Manifest accessible" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Could not verify manifest (may require authentication)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}

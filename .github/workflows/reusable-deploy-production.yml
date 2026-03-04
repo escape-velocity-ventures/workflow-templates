@@ -1,0 +1,662 @@
+# Reusable Deploy-to-Production Workflow
+# Purpose: Perform blue-green cutover with Cloudflare routing + automatic rollback
+# Created: 2026-02-18 to eliminate workflow duplication across app repos
+#
+# Usage in app repos:
+#
+#   jobs:
+#     deploy:
+#       uses: escape-velocity-ventures/workflow-templates/.github/workflows/reusable-deploy-production.yml@main
+#       with:
+#         app-name: my-app
+#         image-name: escape-velocity-ventures/my-app
+#         confirm-cutover: ${{ github.event.inputs.confirm_cutover }}
+#         production-hostname: my-app.example.com
+#         preview-hostname: preview.my-app.example.com
+#         tunnel-id: ${{ vars.TUNNEL_ID }}
+#         zone-id: ${{ vars.ZONE_ID }}
+#       secrets: inherit
+
+name: Reusable Deploy to Production
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Application name (matches K8s deployment name)'
+        required: true
+        type: string
+      image-name:
+        description: 'Full image name without registry (e.g. escape-velocity-ventures/my-app)'
+        required: true
+        type: string
+      confirm-cutover:
+        description: 'Must be "CUTOVER" to proceed'
+        required: true
+        type: string
+      rollback-on-failure:
+        description: 'Automatically rollback if postvalidation fails'
+        type: boolean
+        default: true
+      production-hostname:
+        description: 'Production hostname'
+        required: true
+        type: string
+      preview-hostname:
+        description: 'Preview/inactive slot hostname'
+        required: true
+        type: string
+      tunnel-id:
+        description: 'Cloudflare tunnel ID'
+        required: true
+        type: string
+      zone-id:
+        description: 'Cloudflare zone ID'
+        required: true
+        type: string
+      deployment-name:
+        description: 'K8s deployment name (default: app-name)'
+        type: string
+        default: ''
+      production-namespace-prefix:
+        description: 'Override production namespace prefix (default: {app-name}-production). Yields {prefix}-blue/green'
+        type: string
+        default: ''
+      bluegreen-key:
+        description: 'ConfigMap key for blue-green state (default: app-name)'
+        type: string
+        default: ''
+    secrets:
+      GH_PAT:
+        required: true
+      KUBECONFIG_PRODUCTION:
+        required: true
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      SLACK_WEBHOOK_DEPLOY:
+        required: false
+
+jobs:
+  # =============================================================
+  # Confirm Intent
+  # =============================================================
+  confirm:
+    name: Confirm Cutover Intent
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Verify confirmation
+        id: check
+        run: |
+          if [ "${{ inputs.confirm-cutover }}" != "CUTOVER" ]; then
+            echo "Confirmation required: type 'CUTOVER' to proceed"
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "Cutover confirmed"
+          echo "proceed=true" >> $GITHUB_OUTPUT
+
+  # =============================================================
+  # Detect Active/Inactive Slots
+  # =============================================================
+  detect-slots:
+    name: Detect Slots
+    runs-on: arc-runner-set
+    needs: confirm
+    outputs:
+      active-slot: ${{ steps.detect.outputs.active }}
+      inactive-slot: ${{ steps.detect.outputs.inactive }}
+      inactive-namespace: ${{ steps.detect.outputs.namespace }}
+    steps:
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Detect slots from cluster ConfigMap
+        id: detect
+        run: |
+          BG_KEY="${{ inputs.bluegreen-key || inputs.app-name }}"
+          NS_PREFIX="${{ inputs.production-namespace-prefix || format('{0}-production', inputs.app-name) }}"
+
+          # Read active slot from cluster ConfigMap (source of truth)
+          # MUST succeed — silent defaults mask RBAC/connectivity failures (PM-047)
+          ACTIVE_SLOT=$(kubectl get configmap bluegreen-state -n infrastructure -o jsonpath="{.data.${BG_KEY}}" 2>&1)
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -ne 0 ] || [ -z "$ACTIVE_SLOT" ]; then
+            echo "::error::Failed to read bluegreen-state ConfigMap (exit=$EXIT_CODE, value='$ACTIVE_SLOT'). Cannot determine active slot. Fix RBAC or connectivity."
+            exit 1
+          fi
+          if [ "$ACTIVE_SLOT" != "blue" ] && [ "$ACTIVE_SLOT" != "green" ]; then
+            echo "::error::Invalid slot value '$ACTIVE_SLOT' in bluegreen-state ConfigMap. Expected 'blue' or 'green'."
+            exit 1
+          fi
+
+          echo "Current active slot: $ACTIVE_SLOT"
+
+          # Determine inactive slot
+          if [ "$ACTIVE_SLOT" = "blue" ]; then
+            INACTIVE_SLOT="green"
+            INACTIVE_NAMESPACE="${NS_PREFIX}-green"
+          else
+            INACTIVE_SLOT="blue"
+            INACTIVE_NAMESPACE="${NS_PREFIX}-blue"
+          fi
+
+          echo "Inactive slot: $INACTIVE_SLOT"
+          echo "Inactive namespace: $INACTIVE_NAMESPACE"
+
+          echo "active=$ACTIVE_SLOT" >> $GITHUB_OUTPUT
+          echo "inactive=$INACTIVE_SLOT" >> $GITHUB_OUTPUT
+          echo "namespace=$INACTIVE_NAMESPACE" >> $GITHUB_OUTPUT
+
+  # =============================================================
+  # Verify Inactive Slot is Ready
+  # =============================================================
+  verify-inactive:
+    name: Verify Inactive Slot (${{ needs.detect-slots.outputs.inactive-slot }})
+    runs-on: arc-runner-set
+    needs: detect-slots
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Check inactive slot deployment
+        id: check
+        run: |
+          INACTIVE_NAMESPACE="${{ needs.detect-slots.outputs.inactive-namespace }}"
+          INACTIVE_SLOT="${{ needs.detect-slots.outputs.inactive-slot }}"
+
+          echo "Checking deployment in $INACTIVE_NAMESPACE (slot: $INACTIVE_SLOT)..."
+
+          DEPLOY_NAME="${{ inputs.deployment-name || inputs.app-name }}"
+          READY_REPLICAS=$(kubectl get deployment $DEPLOY_NAME -n $INACTIVE_NAMESPACE -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+
+          if [ "$READY_REPLICAS" -gt "0" ]; then
+            echo "Inactive slot has $READY_REPLICAS ready replicas"
+            echo "ready=true" >> $GITHUB_OUTPUT
+          else
+            echo "Inactive slot has no ready replicas"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Health check via preview URL
+        run: |
+          PREVIEW_URL="https://${{ inputs.preview-hostname }}"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PREVIEW_URL" || echo "000")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Preview endpoint healthy (HTTP $HTTP_CODE)"
+          else
+            echo "Preview endpoint not healthy (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+  # =============================================================
+  # Cutover Traffic
+  # =============================================================
+  cutover:
+    name: Cutover to ${{ needs.detect-slots.outputs.inactive-slot }}
+    runs-on: arc-runner-set
+    needs: [detect-slots, verify-inactive]
+    environment:
+      name: production
+      url: https://${{ inputs.production-hostname }}
+    outputs:
+      previous-slot: ${{ needs.detect-slots.outputs.active-slot }}
+      new-slot: ${{ needs.detect-slots.outputs.inactive-slot }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.ref }}
+
+      # --- Inline Slack: Deploy Start ---
+      - name: Notify Slack - Deploy Start
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
+          echo "::add-mask::$WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          WORKFLOW_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PAYLOAD="{
+            \"attachments\": [{
+              \"color\": \"#1E90FF\",
+              \"blocks\": [
+                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\":rocket: Deployment Started\",\"emoji\":true}},
+                {\"type\":\"section\",\"fields\":[
+                  {\"type\":\"mrkdwn\",\"text\":\"*Repository:*\\n<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\nproduction\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Slot:*\\n${{ needs.detect-slots.outputs.inactive-slot }}\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Ref:*\\n$GITHUB_REF_NAME ($SHORT_SHA)\"}
+                ]},
+                {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Triggered by $GITHUB_ACTOR | <$WORKFLOW_URL|View Workflow>\"}]}
+              ]
+            }]
+          }"
+          curl -s -o /dev/null -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" || true
+
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Perform cutover via Cloudflare API
+        id: cutover
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          DEPLOY_NAME="${{ inputs.deployment-name || inputs.app-name }}"
+          NS_PREFIX="${{ inputs.production-namespace-prefix || format('{0}-production', inputs.app-name) }}"
+          TUNNEL_ID="${{ inputs.tunnel-id }}"
+          PRODUCTION_HOSTNAME="${{ inputs.production-hostname }}"
+          PREVIEW_HOSTNAME="${{ inputs.preview-hostname }}"
+          NEW_SLOT="${{ needs.detect-slots.outputs.inactive-slot }}"
+          PREVIOUS_SLOT="${{ needs.detect-slots.outputs.active-slot }}"
+
+          echo "Cutting over from $PREVIOUS_SLOT to $NEW_SLOT..."
+
+          # Build new service URL based on slot
+          if [ "$NEW_SLOT" = "green" ]; then
+            PROD_SERVICE="http://${DEPLOY_NAME}.${NS_PREFIX}-green.svc.cluster.local:80"
+            PREVIEW_SERVICE="http://${DEPLOY_NAME}.${NS_PREFIX}-blue.svc.cluster.local:80"
+          else
+            PROD_SERVICE="http://${DEPLOY_NAME}.${NS_PREFIX}-blue.svc.cluster.local:80"
+            PREVIEW_SERVICE="http://${DEPLOY_NAME}.${NS_PREFIX}-green.svc.cluster.local:80"
+          fi
+
+          # Get current tunnel config
+          echo "Getting current tunnel configuration..."
+          CURRENT_CONFIG=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")
+
+          # Update the ingress rules for hostnames
+          echo "Updating Cloudflare tunnel routes..."
+          NEW_CONFIG=$(echo "$CURRENT_CONFIG" | jq \
+            --arg prod_svc "$PROD_SERVICE" \
+            --arg preview_svc "$PREVIEW_SERVICE" \
+            --arg prod_host "$PRODUCTION_HOSTNAME" \
+            --arg preview_host "$PREVIEW_HOSTNAME" '
+            .result.config.ingress |= map(
+              if .hostname == $prod_host then
+                .service = $prod_svc
+              elif .hostname == $preview_host then
+                .service = $preview_svc
+              else
+                .
+              end
+            ) | .result.config
+          ')
+
+          # Apply the updated config
+          curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$NEW_CONFIG" | jq -r 'if .success then "Cloudflare routes updated" else "Failed: \(.errors[0].message)" end'
+
+          echo "Cutover complete"
+
+      - name: Update cluster slot state
+        run: |
+          BG_KEY="${{ inputs.bluegreen-key || inputs.app-name }}"
+          NEW_SLOT="${{ needs.detect-slots.outputs.inactive-slot }}"
+
+          # Update the cluster ConfigMap (source of truth for slot state)
+          kubectl patch configmap bluegreen-state -n infrastructure \
+            -p "{\"data\":{\"${BG_KEY}\":\"${NEW_SLOT}\"}}"
+
+          echo "Updated bluegreen-state ConfigMap: ${BG_KEY}=${NEW_SLOT}"
+
+      - name: Purge Cloudflare cache
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          # Purge critical files that don't have content hashes
+          # See PM-014: Old HTML served after deployment due to CDN caching
+          PURGE_RESULT=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ inputs.zone-id }}/purge_cache" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"files\": [
+                \"https://${{ inputs.production-hostname }}/\",
+                \"https://${{ inputs.production-hostname }}/index.html\",
+                \"https://${{ inputs.production-hostname }}/env-config.js\"
+              ]
+            }")
+          PURGE_SUCCESS=$(echo "$PURGE_RESULT" | jq -r '.success')
+          if [ "$PURGE_SUCCESS" = "true" ]; then
+            echo "Cache purged successfully"
+          else
+            echo "Cache purge failed: $PURGE_RESULT"
+            exit 1
+          fi
+
+  # =============================================================
+  # Postvalidation
+  # =============================================================
+  postvalidation:
+    name: Postvalidation Checks
+    runs-on: arc-runner-set
+    needs: [detect-slots, cutover]
+    outputs:
+      passed: ${{ steps.validate.outputs.passed }}
+    steps:
+      - name: Wait for routing propagation
+        run: |
+          echo "Waiting 30 seconds for DNS/routing propagation..."
+          sleep 30
+
+      - name: Run postvalidation checks
+        id: validate
+        run: |
+          PROD_URL="https://${{ inputs.production-hostname }}"
+
+          echo "Running postvalidation against $PROD_URL..."
+
+          PASSED=true
+
+          # Health check
+          for i in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PROD_URL" || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed (HTTP $HTTP_CODE)"
+              break
+            fi
+            echo "Attempt $i: HTTP $HTTP_CODE, retrying..."
+            sleep 5
+            if [ "$i" = "5" ]; then
+              echo "Health check failed after 5 attempts"
+              PASSED=false
+            fi
+          done
+
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+
+          if [ "$PASSED" = "false" ]; then
+            exit 1
+          fi
+
+      - name: Postvalidation Summary
+        if: always()
+        run: |
+          echo "## Postvalidation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.validate.outputs.passed == 'true' && 'Passed' || 'Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Checks Performed" >> $GITHUB_STEP_SUMMARY
+          echo "- Health endpoint responding (HTTP 200)" >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================
+  # Rollback (if postvalidation fails)
+  # =============================================================
+  rollback:
+    name: Rollback on Failure
+    runs-on: arc-runner-set
+    needs: [detect-slots, cutover, postvalidation]
+    if: failure() && inputs.rollback-on-failure
+    steps:
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Rollback via Cloudflare API
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          DEPLOY_NAME="${{ inputs.deployment-name || inputs.app-name }}"
+          NS_PREFIX="${{ inputs.production-namespace-prefix || format('{0}-production', inputs.app-name) }}"
+          TUNNEL_ID="${{ inputs.tunnel-id }}"
+          PRODUCTION_HOSTNAME="${{ inputs.production-hostname }}"
+          PREVIEW_HOSTNAME="${{ inputs.preview-hostname }}"
+          PREVIOUS="${{ needs.detect-slots.outputs.active-slot }}"
+
+          echo "Postvalidation failed! Rolling back to $PREVIOUS..."
+
+          # Build service URLs for rollback (reverse of cutover)
+          if [ "$PREVIOUS" = "blue" ]; then
+            PROD_SERVICE="http://${DEPLOY_NAME}.${NS_PREFIX}-blue.svc.cluster.local:80"
+            PREVIEW_SERVICE="http://${DEPLOY_NAME}.${NS_PREFIX}-green.svc.cluster.local:80"
+          else
+            PROD_SERVICE="http://${DEPLOY_NAME}.${NS_PREFIX}-green.svc.cluster.local:80"
+            PREVIEW_SERVICE="http://${DEPLOY_NAME}.${NS_PREFIX}-blue.svc.cluster.local:80"
+          fi
+
+          # Get current tunnel config
+          CURRENT_CONFIG=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")
+
+          # Update ingress rules back to previous slot
+          NEW_CONFIG=$(echo "$CURRENT_CONFIG" | jq \
+            --arg prod_svc "$PROD_SERVICE" \
+            --arg preview_svc "$PREVIEW_SERVICE" \
+            --arg prod_host "$PRODUCTION_HOSTNAME" \
+            --arg preview_host "$PREVIEW_HOSTNAME" '
+            .result.config.ingress |= map(
+              if .hostname == $prod_host then
+                .service = $prod_svc
+              elif .hostname == $preview_host then
+                .service = $preview_svc
+              else
+                .
+              end
+            ) | .result.config
+          ')
+
+          curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$NEW_CONFIG" | jq -r 'if .success then "Cloudflare routes rolled back" else "Failed: \(.errors[0].message)" end'
+
+          # Update ConfigMap with the rolled-back slot
+          kubectl patch configmap bluegreen-state -n infrastructure \
+            -p "{\"data\":{\"${APP_NAME}\":\"${PREVIOUS}\"}}"
+
+          echo "Rollback complete"
+
+      - name: Purge Cloudflare cache after rollback
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          PURGE_RESULT=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ inputs.zone-id }}/purge_cache" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"files\": [
+                \"https://${{ inputs.production-hostname }}/\",
+                \"https://${{ inputs.production-hostname }}/index.html\",
+                \"https://${{ inputs.production-hostname }}/env-config.js\"
+              ]
+            }")
+          echo "$PURGE_RESULT" | jq -r '.success' | grep -q true && echo "Cache purged after rollback" || echo "Cache purge failed (non-fatal)"
+
+      # --- Inline Slack: Rollback ---
+      - name: Notify Slack - Rollback
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
+          echo "::add-mask::$WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          WORKFLOW_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PAYLOAD="{
+            \"attachments\": [{
+              \"color\": \"#ffc107\",
+              \"blocks\": [
+                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\":rewind: Rollback Triggered\",\"emoji\":true}},
+                {\"type\":\"section\",\"fields\":[
+                  {\"type\":\"mrkdwn\",\"text\":\"*Repository:*\\n<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\nproduction\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Slot:*\\n${{ needs.detect-slots.outputs.active-slot }}\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Ref:*\\n$GITHUB_REF_NAME ($SHORT_SHA)\"}
+                ]},
+                {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Triggered by $GITHUB_ACTOR | <$WORKFLOW_URL|View Workflow>\"}]}
+              ]
+            }]
+          }"
+          curl -s -o /dev/null -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" || true
+
+      - name: Rollback Summary
+        run: |
+          echo "## Automatic Rollback Performed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Postvalidation failed, traffic has been rolled back to **${{ needs.detect-slots.outputs.active-slot }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Please investigate the issue before attempting another deployment." >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================
+  # Summary
+  # =============================================================
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [detect-slots, verify-inactive, cutover, postvalidation]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Production Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://${{ inputs.production-hostname }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Previous Slot:** ${{ needs.detect-slots.outputs.active-slot }}" >> $GITHUB_STEP_SUMMARY
+          echo "**New Slot:** ${{ needs.detect-slots.outputs.inactive-slot }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Detect Slots | ${{ needs.detect-slots.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Verify Inactive | ${{ needs.verify-inactive.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cutover | ${{ needs.cutover.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Postvalidation | ${{ needs.postvalidation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.postvalidation.result }}" = "success" ]; then
+            echo "**Production deployment successful!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Production deployment had issues**" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ inputs.rollback-on-failure }}" = "true" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Automatic rollback was triggered." >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      # --- Inline Slack: Success/Failure ---
+      - name: Notify Slack - Success
+        if: needs.postvalidation.result == 'success'
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
+          echo "::add-mask::$WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          WORKFLOW_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PAYLOAD="{
+            \"attachments\": [{
+              \"color\": \"#36a64f\",
+              \"blocks\": [
+                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\":white_check_mark: Deployment Successful\",\"emoji\":true}},
+                {\"type\":\"section\",\"fields\":[
+                  {\"type\":\"mrkdwn\",\"text\":\"*Repository:*\\n<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\nproduction\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Slot:*\\n${{ needs.detect-slots.outputs.inactive-slot }}\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Ref:*\\n$GITHUB_REF_NAME ($SHORT_SHA)\"}
+                ]},
+                {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Triggered by $GITHUB_ACTOR | <$WORKFLOW_URL|View Workflow>\"}]}
+              ]
+            }]
+          }"
+          curl -s -o /dev/null -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" || true
+
+      - name: Notify Slack - Failure
+        if: needs.postvalidation.result != 'success'
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
+          echo "::add-mask::$WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          WORKFLOW_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PAYLOAD="{
+            \"attachments\": [{
+              \"color\": \"#dc3545\",
+              \"blocks\": [
+                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\":x: Deployment Failed\",\"emoji\":true}},
+                {\"type\":\"section\",\"fields\":[
+                  {\"type\":\"mrkdwn\",\"text\":\"*Repository:*\\n<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\nproduction\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Slot:*\\n${{ needs.detect-slots.outputs.inactive-slot }}\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Ref:*\\n$GITHUB_REF_NAME ($SHORT_SHA)\"}
+                ]},
+                {\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"*Error:*\\n\`\`\`Production deployment failed\`\`\`\"}},
+                {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Triggered by $GITHUB_ACTOR | <$WORKFLOW_URL|View Workflow>\"}]}
+              ]
+            }]
+          }"
+          curl -s -o /dev/null -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" || true

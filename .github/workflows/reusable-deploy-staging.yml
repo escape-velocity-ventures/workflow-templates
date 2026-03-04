@@ -1,0 +1,355 @@
+# Reusable Deploy-to-Staging Workflow
+# Purpose: Validate bundle + deploy to K8s staging + cache purge + registry commit + Slack
+# Created: 2026-02-18 to eliminate workflow duplication across app repos
+#
+# This workflow handles the DEPLOY portion of staging. Test/build/migrate jobs
+# remain in the calling repo (they vary by runtime: Bun vs npm, web/ vs root).
+#
+# Usage in app repos:
+#
+#   jobs:
+#     test: ...    # app-specific
+#     build: ...   # app-specific
+#     migrate: ... # app-specific
+#     deploy:
+#       needs: [build, migrate]
+#       uses: escape-velocity-ventures/workflow-templates/.github/workflows/reusable-deploy-staging.yml@main
+#       with:
+#         app-name: my-app
+#         image-name: escape-velocity-ventures/my-app
+#         image-tag: ${{ needs.build.outputs.image-tag }}
+#         staging-hostname: staging.my-app.example.com
+#         zone-id: ${{ vars.ZONE_ID }}
+#       secrets: inherit
+
+name: Reusable Deploy to Staging
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Application name (matches K8s deployment name)'
+        required: true
+        type: string
+      image-name:
+        description: 'Full image name without registry (e.g. escape-velocity-ventures/my-app)'
+        required: true
+        type: string
+      image-tag:
+        description: 'Immutable image tag (SHA) from build job'
+        required: true
+        type: string
+      image-digest:
+        description: 'Image digest from build job (optional, for summary)'
+        type: string
+        default: ''
+      staging-hostname:
+        description: 'Staging hostname for cache purge and summary'
+        required: true
+        type: string
+      zone-id:
+        description: 'Cloudflare zone ID for cache purge'
+        required: true
+        type: string
+      deployment-name:
+        description: 'K8s deployment name (default: app-name)'
+        type: string
+        default: ''
+      staging-namespace:
+        description: 'Override staging namespace (default: {app-name}-staging)'
+        type: string
+        default: ''
+      skip-bundle-validation:
+        description: 'Skip SPA bundle extraction and validation (for non-SPA services)'
+        type: boolean
+        default: false
+      skip-cache-purge:
+        description: 'Skip Cloudflare cache purge (for non-CDN services)'
+        type: boolean
+        default: false
+    secrets:
+      GH_PAT:
+        required: true
+      KUBECONFIG_STAGING:
+        required: true
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      SLACK_WEBHOOK_DEPLOY:
+        required: false
+
+jobs:
+  # =============================================================
+  # Validate Bundle (PM-012 and PM-018 prevention)
+  # =============================================================
+  validate:
+    name: Validate Bundle
+    if: ${{ !inputs.skip-bundle-validation }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout TinkerBelle
+        uses: actions/checkout@v4
+        with:
+          repository: escape-velocity-ventures/TinkerBelle
+          path: TinkerBelle
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Checkout TinkerBelle-config
+        uses: actions/checkout@v4
+        with:
+          repository: escape-velocity-ventures/TinkerBelle-config
+          path: TinkerBelle-config
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: 1.1.38
+
+      - name: Install tb-app dependencies
+        run: |
+          cd TinkerBelle/cli/app-validate
+          bun install
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract bundle from image
+        run: |
+          IMAGE="ghcr.io/${{ inputs.image-name }}:${{ inputs.image-tag }}"
+          echo "Extracting bundle from: $IMAGE"
+          docker create --name extract "$IMAGE"
+          docker cp extract:/usr/share/nginx/html ./dist
+          docker rm extract
+          echo "Bundle extracted:"
+          ls -la ./dist/
+
+      - name: Validate bundle is environment-agnostic
+        run: |
+          cd TinkerBelle/cli/app-validate
+          bun run src/index.ts bundle ${{ github.workspace }}/dist \
+            --mode agnostic \
+            --config ${{ github.workspace }}/TinkerBelle-config \
+            --app ${{ inputs.app-name }}
+
+      - name: Checkout source repo for manifest check
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Validate manifests for floating tags (PM-018)
+        run: |
+          cd TinkerBelle/cli/app-validate
+          bun run src/index.ts manifest ${{ github.workspace }}/source/k8s \
+            --config ${{ github.workspace }}/TinkerBelle-config \
+            --app ${{ inputs.app-name }}
+
+      - name: Validation Summary
+        if: always()
+        run: |
+          echo "## Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Bundle (PM-012)" >> $GITHUB_STEP_SUMMARY
+          echo "**Mode:** Environment-agnostic (no baked URLs allowed)" >> $GITHUB_STEP_SUMMARY
+          echo "Ensures the same image can be deployed to any environment." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Manifests (PM-018)" >> $GITHUB_STEP_SUMMARY
+          echo "**Policy:** No floating image tags (latest, staging, etc.)" >> $GITHUB_STEP_SUMMARY
+          echo "Prevents silent rollout failures from identical tag specs." >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================
+  # Deploy to Kubernetes Staging
+  # =============================================================
+  deploy:
+    name: Deploy to Staging
+    runs-on: arc-runner-set
+    needs: validate
+    if: ${{ !cancelled() && (needs.validate.result == 'success' || needs.validate.result == 'skipped') }}
+    environment:
+      name: staging
+      url: https://${{ inputs.staging-hostname }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.ref }}
+
+      - name: Checkout TinkerBelle
+        uses: actions/checkout@v4
+        with:
+          repository: escape-velocity-ventures/TinkerBelle
+          path: TinkerBelle
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: 1.1.38
+
+      - name: Install tb-ops dependencies
+        run: |
+          cd TinkerBelle/cli/ops
+          bun install
+
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Ensure GHCR pull secret exists
+        run: |
+          kubectl get secret ghcr-pull-secret -n ${{ inputs.staging-namespace || format('{0}-staging', inputs.app-name) }} 2>/dev/null || \
+          kubectl create secret docker-registry ghcr-pull-secret \
+            --namespace=${{ inputs.staging-namespace || format('{0}-staging', inputs.app-name) }} \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update image tag in kustomization
+        run: |
+          cd k8s/staging/app-only
+          if ! command -v kustomize &> /dev/null; then
+            curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+            sudo mv kustomize /usr/local/bin/
+          fi
+          kustomize edit set image ghcr.io/${{ inputs.image-name }}:${{ inputs.image-tag }}
+
+      - name: Deploy with tb-ops
+        run: |
+          cd TinkerBelle/cli/ops
+          bun run src/index.ts stage ${{ github.workspace }}/k8s/staging/app-only \
+            --target ${{ inputs.staging-namespace || format('{0}-staging', inputs.app-name) }} \
+            --config ${{ github.workspace }}/k8s/tinkerbelle.yaml \
+            --force
+
+      - name: Verify deployment
+        env:
+          NAMESPACE: ${{ inputs.staging-namespace || format('{0}-staging', inputs.app-name) }}
+          DEPLOY_NAME: ${{ inputs.deployment-name || inputs.app-name }}
+        run: |
+          kubectl get pods -n $NAMESPACE -l app.kubernetes.io/name=$DEPLOY_NAME
+
+          # Check deployment replica counts directly instead of kubectl wait,
+          # which matches terminating pods during rolling updates and false-fails
+          READY=$(kubectl get deployment $DEPLOY_NAME -n $NAMESPACE \
+            -o jsonpath='{.status.readyReplicas}')
+          DESIRED=$(kubectl get deployment $DEPLOY_NAME -n $NAMESPACE \
+            -o jsonpath='{.spec.replicas}')
+
+          if [ "$READY" = "$DESIRED" ] && [ "$READY" -gt 0 ]; then
+            echo "All $READY/$DESIRED pods are ready"
+          else
+            echo "Only ${READY:-0}/$DESIRED pods ready"
+            exit 1
+          fi
+
+      - name: Purge Cloudflare cache
+        if: ${{ !inputs.skip-cache-purge }}
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          # Purge critical files that don't have content hashes
+          # See PM-014: Old HTML served after deployment due to CDN caching
+          curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ inputs.zone-id }}/purge_cache" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"files\": [
+                \"https://${{ inputs.staging-hostname }}/\",
+                \"https://${{ inputs.staging-hostname }}/index.html\",
+                \"https://${{ inputs.staging-hostname }}/env-config.js\"
+              ]
+            }" | jq -r 'if .success then "Cache purged successfully" else "Cache purge failed: \(.errors[0].message // "unknown error")" end'
+
+      - name: Commit validation registry
+        run: |
+          cd ${{ github.workspace }}
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add k8s/.tb-validation/registry.json
+          git diff --staged --quiet || git commit -m "chore: Update staging validation registry [skip ci]"
+          git push
+
+      - name: Deployment Summary
+        run: |
+          echo "## Staging Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`ghcr.io/${{ inputs.image-name }}:${{ inputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.image-digest }}" ]; then
+            echo "**Digest:** \`${{ inputs.image-digest }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Namespace:** ${{ inputs.staging-namespace || format('{0}-staging', inputs.app-name) }}" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://${{ inputs.staging-hostname }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Test staging deployment" >> $GITHUB_STEP_SUMMARY
+          echo "2. Run \`stage-production\` workflow to deploy to preview slot" >> $GITHUB_STEP_SUMMARY
+          echo "3. Run \`deploy-production\` workflow to cutover traffic" >> $GITHUB_STEP_SUMMARY
+
+      # --- Inline Slack Notifications ---
+      - name: Notify Slack - staging deployed
+        if: success()
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
+          echo "::add-mask::$WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          WORKFLOW_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PAYLOAD="{
+            \"attachments\": [{
+              \"color\": \"#36a64f\",
+              \"blocks\": [
+                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\":white_check_mark: Deployment Successful\",\"emoji\":true}},
+                {\"type\":\"section\",\"fields\":[
+                  {\"type\":\"mrkdwn\",\"text\":\"*Repository:*\\n<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\nstaging\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Ref:*\\n$GITHUB_REF_NAME ($SHORT_SHA)\"}
+                ]},
+                {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Triggered by $GITHUB_ACTOR | <$WORKFLOW_URL|View Workflow>\"}]}
+              ]
+            }]
+          }"
+          curl -s -o /dev/null -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" || true
+
+      - name: Notify Slack - staging failed
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
+          echo "::add-mask::$WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          WORKFLOW_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          PAYLOAD="{
+            \"attachments\": [{
+              \"color\": \"#dc3545\",
+              \"blocks\": [
+                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\":x: Deployment Failed\",\"emoji\":true}},
+                {\"type\":\"section\",\"fields\":[
+                  {\"type\":\"mrkdwn\",\"text\":\"*Repository:*\\n<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\nstaging\"},
+                  {\"type\":\"mrkdwn\",\"text\":\"*Ref:*\\n$GITHUB_REF_NAME ($SHORT_SHA)\"}
+                ]},
+                {\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"*Error:*\\n\`\`\`Staging deployment failed - check workflow logs\`\`\`\"}},
+                {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"Triggered by $GITHUB_ACTOR | <$WORKFLOW_URL|View Workflow>\"}]}
+              ]
+            }]
+          }"
+          curl -s -o /dev/null -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" || true

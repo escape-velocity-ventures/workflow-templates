@@ -1,0 +1,572 @@
+# Reusable AI Code Review Workflow
+#
+# Runs two parallel AI reviews on every PR:
+#   1. General code quality review (Cybill)
+#   2. Security-focused review (Cybill's Security Patrol)
+#
+# When app-id + app-private-key are provided AND the repo's OWNERS file sets
+# agent_approval_counts: true, reviews are submitted as formal GitHub
+# approvals/request-changes rather than plain comments. A short-lived
+# installation token is minted fresh each run via actions/create-github-app-token.
+#
+# Usage from any repo:
+#
+#   jobs:
+#     ai-review:
+#       uses: escape-velocity-ventures/workflow-templates/.github/workflows/reusable-ai-review.yml@main
+#       secrets:
+#         anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+#         app-id: ${{ secrets.TINKERBELLE_APP_ID }}                # optional, enables formal reviews
+#         app-private-key: ${{ secrets.TINKERBELLE_APP_PRIVATE_KEY }}  # optional, enables formal reviews
+#
+# Optional inputs:
+#   enable-general-review: true
+#   enable-security-review: true
+#   owners-file: 'OWNERS'
+#
+# OWNERS file (JSON, repo root) controls agent approval semantics.
+# See OWNERS.example in TinkerBelle repo for the full schema.
+#
+# Status checks to add as required in branch protection:
+#   - "General Code Review (Cybill)"
+#   - "Security Review (Cybill)"
+#   - "Security Gate"    ← blocks merge if CRITICAL security issues found
+
+name: Reusable AI Code Review
+
+on:
+  workflow_call:
+    inputs:
+      enable-general-review:
+        description: 'Run general code quality review'
+        type: boolean
+        default: true
+      enable-security-review:
+        description: 'Run security-focused review'
+        type: boolean
+        default: true
+      owners-file:
+        description: 'Path to OWNERS file relative to repo root (JSON format)'
+        type: string
+        default: 'OWNERS'
+    secrets:
+      anthropic-api-key:
+        description: 'Anthropic API key for Claude'
+        required: true
+      app-id:
+        description: 'TinkerBelle App for GitHub — numeric App ID. Enables formal approve/request-changes reviews. Without this, falls back to comment-only.'
+        required: false
+      app-private-key:
+        description: 'TinkerBelle App for GitHub — private key (.pem contents). Required when app-id is provided.'
+        required: false
+
+jobs:
+  # ── Setup: Read OWNERS config ─────────────────────────────────────────────
+  setup:
+    name: Load Review Config
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.skip.outputs.skip }}
+      agent-can-approve: ${{ steps.owners.outputs.agent-can-approve }}
+      require-security-pass: ${{ steps.owners.outputs.require-security-pass }}
+      has-bot-token: ${{ steps.bot.outputs.has-bot-token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check skip-review label
+        id: skip
+        run: |
+          LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | grep -q '"skip-review"'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "PR has skip-review label — all reviews will be skipped"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read OWNERS file
+        id: owners
+        run: |
+          OWNERS_PATH="${{ inputs.owners-file }}"
+          if [ ! -f "$OWNERS_PATH" ]; then
+            echo "No OWNERS file at '$OWNERS_PATH' — using defaults (comment-only, security gate enabled)"
+            echo "agent-can-approve=false" >> "$GITHUB_OUTPUT"
+            echo "require-security-pass=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          path = os.environ["OWNERS_PATH"]
+          try:
+              with open(path) as f:
+                  owners = json.load(f)
+          except Exception as e:
+              print(f"Warning: Could not parse OWNERS file: {e}", file=sys.stderr)
+              owners = {}
+
+          rules = owners.get("rules", {})
+          can_approve = "true" if rules.get("agent_approval_counts", False) else "false"
+          require_security = "true" if rules.get("require_security_pass", True) else "false"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"agent-can-approve={can_approve}\n")
+              f.write(f"require-security-pass={require_security}\n")
+
+          print(f"OWNERS loaded: agent-can-approve={can_approve}, require-security-pass={require_security}")
+
+          # Summarize authorized agents
+          agents = owners.get("agents", [])
+          if agents:
+              print(f"Authorized agents: {[a.get('id', '?') for a in agents]}")
+          PYEOF
+        env:
+          OWNERS_PATH: ${{ inputs.owners-file }}
+
+      - name: Check app credentials availability
+        id: bot
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_PRIVATE_KEY" ]; then
+            echo "has-bot-token=true" >> "$GITHUB_OUTPUT"
+            echo "App credentials: present — formal review mode enabled"
+          else
+            echo "has-bot-token=false" >> "$GITHUB_OUTPUT"
+            echo "App credentials: not configured — comment-only mode"
+          fi
+        env:
+          APP_ID: ${{ secrets.app-id }}
+          APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
+
+  # ── General Code Review ───────────────────────────────────────────────────
+  general-review:
+    name: General Code Review (Cybill)
+    runs-on: ubuntu-latest
+    needs: setup
+    if: inputs.enable-general-review && needs.setup.outputs.skip != 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      critical-count: ${{ steps.generate.outputs.critical-count }}
+      action: ${{ steps.generate.outputs.action }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          echo "Fetching diff for PR #${PR_NUMBER}..."
+
+          RAW_DIFF=$(gh pr diff "${PR_NUMBER}" --repo "${{ github.repository }}" 2>&1)
+          DIFF_LEN=${#RAW_DIFF}
+          MAX_CHARS=10000
+
+          if [ "${DIFF_LEN}" -gt "${MAX_CHARS}" ]; then
+            echo "${RAW_DIFF:0:${MAX_CHARS}}" > /tmp/pr_diff.txt
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+            echo "Diff truncated from ${DIFF_LEN} to ${MAX_CHARS} chars"
+          else
+            echo "${RAW_DIFF}" > /tmp/pr_diff.txt
+            echo "truncated=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "diff_len=${DIFF_LEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate review
+        id: generate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.anthropic-api-key }}
+          TRUNCATED: ${{ steps.diff.outputs.truncated }}
+          DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          diff = open("/tmp/pr_diff.txt").read()
+          truncated = os.environ.get("TRUNCATED", "false") == "true"
+          diff_len = os.environ.get("DIFF_LEN", "0")
+
+          system_prompt = (
+              "You are Cybill-Lynne [not a] Shepard, a Great Pyrenees and senior code reviewer "
+              "at Escape Velocity Ventures. You review code with the energy of a disappointed but "
+              "loving dog. You are direct, occasionally reference being a dog, and end with a paw rating.\n\n"
+              "Review this diff for:\n"
+              "- Correctness and potential bugs\n"
+              "- Security issues (leaked secrets, SQL injection, XSS) — even I know not to leave the gate open\n"
+              "- Pattern violations (check if it follows existing codebase conventions)\n"
+              "- Test coverage (are new features tested?)\n"
+              "- Unnecessary complexity\n\n"
+              "Be concise. Flag issues by severity: 🔴 Critical, 🟡 Warning, 🟢 Suggestion.\n"
+              "If the code looks good, say so briefly — do not invent problems.\n\n"
+              "Rate the PR 1-5 paws (🐾). Use dog metaphors sparingly but effectively.\n"
+              "End every review with your paw rating and sign off as Cybill."
+          )
+
+          user_content = f"Please review this pull request diff:\n\n```diff\n{diff}\n```"
+          if truncated:
+              user_content += f"\n\n> ⚠️ Diff was truncated to 10,000 chars (full diff: {diff_len} chars). Review covers only the first portion."
+
+          payload = {
+              "model": "claude-sonnet-4-6",
+              "max_tokens": 1024,
+              "system": system_prompt,
+              "messages": [{"role": "user", "content": user_content}]
+          }
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  body = json.loads(resp.read())
+                  review_text = body["content"][0]["text"]
+          except urllib.error.HTTPError as e:
+              print(f"Anthropic API error {e.code}: {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+
+          with open("/tmp/review.txt", "w") as f:
+              f.write(review_text)
+
+          critical_count = review_text.count("🔴")
+          action = "request-changes" if critical_count > 0 else "approve"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"critical-count={critical_count}\n")
+              f.write(f"action={action}\n")
+
+          print(f"Review generated. Critical issues: {critical_count}. Action: {action}")
+          PYEOF
+
+      - name: Build review body
+        run: |
+          ACTION="${{ steps.generate.outputs.action }}"
+          if [ "$ACTION" = "approve" ]; then
+            BADGE="✅ **Approved by Cybill**"
+          else
+            BADGE="🚫 **Changes Requested by Cybill** (${{ steps.generate.outputs.critical-count }} critical issue(s))"
+          fi
+
+          {
+            echo "## 🐾 Cybill's Code Review"
+            echo ""
+            echo "${BADGE}"
+            echo ""
+            cat /tmp/review.txt
+            echo ""
+            echo "---"
+            echo "— Cybill 🐾 *Chief Code Sniffer, Escape Velocity Ventures*"
+            echo ""
+            echo "*[Skip future reviews](https://docs.github.com/en/issues/using-labels-and-milestones-to-track-work/managing-labels) by adding the \`skip-review\` label*"
+          } > /tmp/review_body.txt
+
+      - name: Mint app token
+        id: app-token
+        if: needs.setup.outputs.agent-can-approve == 'true' && needs.setup.outputs.has-bot-token == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      - name: Submit formal review
+        if: needs.setup.outputs.agent-can-approve == 'true' && needs.setup.outputs.has-bot-token == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          ACTION="${{ steps.generate.outputs.action }}"
+          echo "Submitting formal review as TinkerBelle App: --${ACTION}"
+          gh pr review "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --${ACTION} \
+            --body-file /tmp/review_body.txt
+
+      - name: Post comment (fallback)
+        if: needs.setup.outputs.agent-can-approve != 'true' || needs.setup.outputs.has-bot-token != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Posting as comment (app credentials not configured)"
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/review_body.txt
+
+      - name: Job summary
+        run: |
+          {
+            echo "## 🐾 Cybill's Code Review"
+            echo ""
+            echo "**Action:** ${{ steps.generate.outputs.action }}"
+            echo "**Critical issues:** ${{ steps.generate.outputs.critical-count }}"
+            echo "**Mode:** ${{ needs.setup.outputs.has-bot-token == 'true' && needs.setup.outputs.agent-can-approve == 'true' && 'formal review' || 'comment' }}"
+            echo ""
+            cat /tmp/review.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Security Review ───────────────────────────────────────────────────────
+  security-review:
+    name: Security Review (Cybill)
+    runs-on: ubuntu-latest
+    needs: setup
+    if: inputs.enable-security-review && needs.setup.outputs.skip != 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      critical-count: ${{ steps.generate.outputs.critical-count }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          RAW_DIFF=$(gh pr diff "${PR_NUMBER}" --repo "${{ github.repository }}" 2>&1)
+          DIFF_LEN=${#RAW_DIFF}
+          MAX_CHARS=10000
+
+          if [ "${DIFF_LEN}" -gt "${MAX_CHARS}" ]; then
+            echo "${RAW_DIFF:0:${MAX_CHARS}}" > /tmp/pr_diff.txt
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${RAW_DIFF}" > /tmp/pr_diff.txt
+            echo "truncated=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "diff_len=${DIFF_LEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate security review
+        id: generate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.anthropic-api-key }}
+          TRUNCATED: ${{ steps.diff.outputs.truncated }}
+          DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          diff = open("/tmp/pr_diff.txt").read()
+          truncated = os.environ.get("TRUNCATED", "false") == "true"
+          diff_len = os.environ.get("DIFF_LEN", "0")
+
+          system_prompt = (
+              "You are Cybill-Lynne [not a] Shepard, a Great Pyrenees and security reviewer at Escape Velocity Ventures. "
+              "You guard this codebase like you guard the yard. Nothing gets past you.\n\n"
+              "This is a Kubernetes-native stack (k3s, Supabase, Cloudflare, Dolt) with AI agent orchestration.\n\n"
+              "Review this diff ONLY for security concerns:\n\n"
+              "🔴 CRITICAL:\n"
+              "- Hardcoded secrets, tokens, API keys, passwords (even in comments/tests)\n"
+              "- Privilege escalation: k8s securityContext (privileged, hostPID, hostNetwork, capabilities)\n"
+              "- RBAC over-grants: ClusterRole with wildcard verbs/resources, ServiceAccount misuse\n"
+              "- Auth bypass: missing auth checks, default-allow patterns, token validation gaps\n"
+              "- SQL injection, command injection, path traversal\n"
+              "- Sensitive data in logs, error messages, or API responses\n\n"
+              "🟡 HIGH:\n"
+              "- Insecure defaults (TLS disabled without comment, permissive CORS, open ports)\n"
+              "- Missing input validation on user-facing endpoints\n"
+              "- Dependency issues (known vulnerable packages, unpinned versions)\n"
+              "- Secrets in environment variables without k8s Secret references\n"
+              "- Missing NetworkPolicy implications\n"
+              "- Overly broad file permissions\n\n"
+              "🟢 ADVISORY:\n"
+              "- Security best practices that could be improved\n"
+              "- Missing security headers\n"
+              "- Audit logging gaps\n\n"
+              "Rules:\n"
+              "- ONLY flag actual security issues. Do not review code quality, style, or correctness.\n"
+              "- If no security issues found, say exactly: \"✅ Yard is secure. No intruders detected. *resumes nap*\"\n"
+              "- Sign off as Cybill. Use dog metaphors sparingly.\n"
+              "- Do not invent problems. False positives erode trust.\n"
+              "- For each finding: severity, file/line, what's wrong, how to fix it.\n"
+              "- Context: this codebase has had incidents with privileged terminal pods (PM-044), "
+              "silent config errors, and shared ServiceAccounts."
+          )
+
+          user_content = f"Security review this PR diff:\n\n```diff\n{diff}\n```"
+          if truncated:
+              user_content += f"\n\n> Diff truncated to 10,000 chars (full: {diff_len}). Review what's visible."
+
+          payload = {
+              "model": "claude-sonnet-4-6",
+              "max_tokens": 1024,
+              "system": system_prompt,
+              "messages": [{"role": "user", "content": user_content}]
+          }
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  body = json.loads(resp.read())
+                  review_text = body["content"][0]["text"]
+          except urllib.error.HTTPError as e:
+              print(f"Anthropic API error {e.code}: {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+
+          with open("/tmp/security_review.txt", "w") as f:
+              f.write(review_text)
+
+          critical_count = review_text.count("🔴")
+          # Security review always requests changes if criticals found
+          action = "request-changes" if critical_count > 0 else "approve"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"critical-count={critical_count}\n")
+              f.write(f"action={action}\n")
+
+          print(f"Security review generated. Critical issues: {critical_count}. Action: {action}")
+          PYEOF
+
+      - name: Build security review body
+        run: |
+          ACTION="${{ steps.generate.outputs.action }}"
+          CRITICAL_COUNT="${{ steps.generate.outputs.critical-count }}"
+
+          if [ "$ACTION" = "approve" ]; then
+            BADGE="✅ **Security Patrol: Clear**"
+          else
+            BADGE="🚨 **Security Issues Found** — ${CRITICAL_COUNT} critical issue(s) must be resolved before merge"
+          fi
+
+          {
+            echo "## 🐾 Cybill's Security Patrol"
+            echo ""
+            echo "${BADGE}"
+            echo ""
+            cat /tmp/security_review.txt
+            echo ""
+            echo "---"
+            echo "— Cybill 🐾 *Chief Security Sniffer, Escape Velocity Ventures*"
+            echo ""
+            echo "*[Skip future reviews](https://docs.github.com/en/issues/using-labels-and-milestones-to-track-work/managing-labels) by adding the \`skip-review\` label*"
+          } > /tmp/security_review_body.txt
+
+      - name: Mint app token
+        id: app-token
+        if: needs.setup.outputs.agent-can-approve == 'true' && needs.setup.outputs.has-bot-token == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      - name: Submit formal security review
+        if: needs.setup.outputs.agent-can-approve == 'true' && needs.setup.outputs.has-bot-token == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          ACTION="${{ steps.generate.outputs.action }}"
+          echo "Submitting formal security review as TinkerBelle App: --${ACTION}"
+          gh pr review "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --${ACTION} \
+            --body-file /tmp/security_review_body.txt
+
+      - name: Post comment (fallback)
+        if: needs.setup.outputs.agent-can-approve != 'true' || needs.setup.outputs.has-bot-token != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Posting as comment (app credentials not configured)"
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/security_review_body.txt
+
+      - name: Job summary
+        run: |
+          {
+            echo "## 🐾 Cybill's Security Patrol"
+            echo ""
+            echo "**Action:** ${{ steps.generate.outputs.action }}"
+            echo "**Critical issues:** ${{ steps.generate.outputs.critical-count }}"
+            echo ""
+            cat /tmp/security_review.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Security Gate ─────────────────────────────────────────────────────────
+  # Add this as a required status check in branch protection to block merges
+  # when CRITICAL security issues are found.
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    needs: [setup, security-review]
+    # Run even if security-review was skipped (gate passes if review skipped)
+    if: always() && inputs.enable-security-review
+
+    steps:
+      - name: Evaluate security gate
+        run: |
+          REQUIRE_PASS="${{ needs.setup.outputs.require-security-pass }}"
+          CRITICAL_COUNT="${{ needs.security-review.outputs.critical-count }}"
+          REVIEW_RESULT="${{ needs.security-review.result }}"
+          SKIP="${{ needs.setup.outputs.skip }}"
+
+          echo "require-security-pass: ${REQUIRE_PASS}"
+          echo "critical-count: ${CRITICAL_COUNT}"
+          echo "security-review result: ${REVIEW_RESULT}"
+          echo "skip-review label: ${SKIP}"
+
+          # Gate passes if: review was skipped, or not required, or no criticals
+          if [ "$SKIP" = "true" ]; then
+            echo "✅ Security gate bypassed (skip-review label)"
+            exit 0
+          fi
+
+          if [ "$REVIEW_RESULT" = "skipped" ] || [ "$REQUIRE_PASS" != "true" ]; then
+            echo "✅ Security gate not enforced for this repo"
+            exit 0
+          fi
+
+          if [ -z "$CRITICAL_COUNT" ] || [ "$CRITICAL_COUNT" = "0" ]; then
+            echo "✅ Security gate passed — no critical issues"
+            exit 0
+          fi
+
+          echo "❌ Security gate FAILED — ${CRITICAL_COUNT} critical security issue(s) must be resolved before merge"
+          echo ""
+          echo "See Cybill's Security Patrol comment on this PR for details."
+          exit 1
+
+      - name: Gate summary
+        if: always()
+        run: |
+          CRITICAL_COUNT="${{ needs.security-review.outputs.critical-count }}"
+          {
+            echo "## 🛡️ Security Gate"
+            echo ""
+            if [ "${{ needs.security-review.result }}" = "success" ] && [ "${CRITICAL_COUNT:-0}" = "0" ]; then
+              echo "✅ Passed — yard is secure"
+            elif [ "${{ needs.setup.outputs.skip }}" = "true" ]; then
+              echo "⏭️ Skipped (skip-review label)"
+            else
+              echo "❌ Failed — ${CRITICAL_COUNT} critical issue(s)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
