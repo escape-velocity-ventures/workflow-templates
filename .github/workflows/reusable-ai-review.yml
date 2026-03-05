@@ -177,7 +177,6 @@ jobs:
       warning-count: ${{ steps.generate.outputs.warning-count }}
       action: ${{ steps.generate.outputs.action }}
       provider: ${{ steps.generate.outputs.provider }}
-      provider: ${{ steps.generate.outputs.provider }}
 
     steps:
       - name: Checkout repository
@@ -434,6 +433,7 @@ jobs:
       critical-count: ${{ steps.generate.outputs.critical-count }}
       warning-count: ${{ steps.generate.outputs.warning-count }}
       action: ${{ steps.generate.outputs.action }}
+      provider: ${{ steps.generate.outputs.provider }}
 
     steps:
       - name: Checkout repository
