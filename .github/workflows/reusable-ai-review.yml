@@ -171,16 +171,9 @@ jobs:
 
           RAW_DIFF=$(gh pr diff "${PR_NUMBER}" --repo "${{ github.repository }}" 2>&1)
           DIFF_LEN=${#RAW_DIFF}
-          MAX_CHARS=10000
-
-          if [ "${DIFF_LEN}" -gt "${MAX_CHARS}" ]; then
-            echo "${RAW_DIFF:0:${MAX_CHARS}}" > /tmp/pr_diff.txt
-            echo "truncated=true" >> "$GITHUB_OUTPUT"
-            echo "Diff truncated from ${DIFF_LEN} to ${MAX_CHARS} chars"
-          else
-            echo "${RAW_DIFF}" > /tmp/pr_diff.txt
-            echo "truncated=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "${RAW_DIFF}" > /tmp/pr_diff.txt
+          echo "truncated=false" >> "$GITHUB_OUTPUT"
+          echo "Diff captured in full (${DIFF_LEN} chars)"
           echo "diff_len=${DIFF_LEN}" >> "$GITHUB_OUTPUT"
 
       - name: Generate review
@@ -215,7 +208,7 @@ jobs:
 
           user_content = f"Please review this pull request diff:\n\n```diff\n{diff}\n```"
           if truncated:
-              user_content += f"\n\n> ⚠️ Diff was truncated to 10,000 chars (full diff: {diff_len} chars). Review covers only the first portion."
+              user_content += f"\n\n> ⚠️ Diff was truncated (full diff: {diff_len} chars). Review what's visible."
 
           payload = {
               "model": "claude-sonnet-4-6",
@@ -346,15 +339,9 @@ jobs:
           PR_NUMBER=${{ github.event.pull_request.number }}
           RAW_DIFF=$(gh pr diff "${PR_NUMBER}" --repo "${{ github.repository }}" 2>&1)
           DIFF_LEN=${#RAW_DIFF}
-          MAX_CHARS=10000
-
-          if [ "${DIFF_LEN}" -gt "${MAX_CHARS}" ]; then
-            echo "${RAW_DIFF:0:${MAX_CHARS}}" > /tmp/pr_diff.txt
-            echo "truncated=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "${RAW_DIFF}" > /tmp/pr_diff.txt
-            echo "truncated=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "${RAW_DIFF}" > /tmp/pr_diff.txt
+          echo "truncated=false" >> "$GITHUB_OUTPUT"
+          echo "Diff captured in full (${DIFF_LEN} chars)"
           echo "diff_len=${DIFF_LEN}" >> "$GITHUB_OUTPUT"
 
       - name: Generate security review
@@ -406,7 +393,7 @@ jobs:
 
           user_content = f"Security review this PR diff:\n\n```diff\n{diff}\n```"
           if truncated:
-              user_content += f"\n\n> Diff truncated to 10,000 chars (full: {diff_len}). Review what's visible."
+              user_content += f"\n\n> ⚠️ Diff was truncated (full diff: {diff_len} chars). Review what's visible."
 
           payload = {
               "model": "claude-sonnet-4-6",
