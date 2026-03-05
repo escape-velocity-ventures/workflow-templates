@@ -32,7 +32,7 @@
 # Status checks to add as required in branch protection:
 #   - "General Code Review (Cybill)"
 #   - "Security Review (Cybill)"
-#   - "Security Gate"    ← blocks merge if CRITICAL security issues found
+#   - "Security Gate"    ← blocks merge when Cybill requests changes
 
 name: Reusable AI Code Review
 
@@ -47,6 +47,14 @@ on:
         description: 'Run security-focused review'
         type: boolean
         default: true
+      fail-on-warnings:
+        description: 'Treat warning-level findings (🟡) as merge-blocking in both reviews'
+        type: boolean
+        default: false
+      require-general-pass:
+        description: 'Fail General Code Review check when Cybill requests changes'
+        type: boolean
+        default: false
       owners-file:
         description: 'Path to OWNERS file relative to repo root (JSON format)'
         type: string
@@ -153,6 +161,7 @@ jobs:
       pull-requests: write
     outputs:
       critical-count: ${{ steps.generate.outputs.critical-count }}
+      warning-count: ${{ steps.generate.outputs.warning-count }}
       action: ${{ steps.generate.outputs.action }}
 
     steps:
@@ -182,6 +191,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TRUNCATED: ${{ steps.diff.outputs.truncated }}
           DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
+          FAIL_ON_WARNINGS: ${{ inputs.fail-on-warnings }}
         run: |
           python3 - <<'PYEOF'
           import json, os, sys, urllib.request, urllib.error
@@ -240,13 +250,16 @@ jobs:
               f.write(review_text)
 
           critical_count = review_text.count("🔴")
-          action = "request-changes" if critical_count > 0 else "approve"
+          warning_count = review_text.count("🟡")
+          fail_on_warnings = os.environ.get("FAIL_ON_WARNINGS", "false") == "true"
+          action = "request-changes" if (critical_count > 0 or (fail_on_warnings and warning_count > 0)) else "approve"
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"critical-count={critical_count}\n")
+              f.write(f"warning-count={warning_count}\n")
               f.write(f"action={action}\n")
 
-          print(f"Review generated. Critical issues: {critical_count}. Action: {action}")
+          print(f"Review generated. Critical issues: {critical_count}. Warnings: {warning_count}. Action: {action}")
           PYEOF
 
       - name: Build review body
@@ -308,10 +321,21 @@ jobs:
             echo ""
             echo "**Action:** ${{ steps.generate.outputs.action }}"
             echo "**Critical issues:** ${{ steps.generate.outputs.critical-count }}"
+            echo "**Warnings:** ${{ steps.generate.outputs.warning-count }}"
             echo "**Mode:** ${{ needs.setup.outputs.has-bot-token == 'true' && needs.setup.outputs.agent-can-approve == 'true' && 'formal review' || 'comment' }}"
             echo ""
             cat /tmp/review.txt
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: General gate
+        if: always() && inputs.require-general-pass
+        run: |
+          ACTION="${{ steps.generate.outputs.action }}"
+          if [ "$ACTION" = "request-changes" ]; then
+            echo "❌ General gate FAILED — Cybill requested changes"
+            exit 1
+          fi
+          echo "✅ General gate passed"
 
   # ── Security Review ───────────────────────────────────────────────────────
   security-review:
@@ -324,6 +348,8 @@ jobs:
       pull-requests: write
     outputs:
       critical-count: ${{ steps.generate.outputs.critical-count }}
+      warning-count: ${{ steps.generate.outputs.warning-count }}
+      action: ${{ steps.generate.outputs.action }}
 
     steps:
       - name: Checkout repository
@@ -350,6 +376,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TRUNCATED: ${{ steps.diff.outputs.truncated }}
           DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
+          FAIL_ON_WARNINGS: ${{ inputs.fail-on-warnings }}
         run: |
           python3 - <<'PYEOF'
           import json, os, sys, urllib.request, urllib.error
@@ -425,25 +452,28 @@ jobs:
               f.write(review_text)
 
           critical_count = review_text.count("🔴")
-          # Security review always requests changes if criticals found
-          action = "request-changes" if critical_count > 0 else "approve"
+          warning_count = review_text.count("🟡")
+          fail_on_warnings = os.environ.get("FAIL_ON_WARNINGS", "false") == "true"
+          action = "request-changes" if (critical_count > 0 or (fail_on_warnings and warning_count > 0)) else "approve"
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"critical-count={critical_count}\n")
+              f.write(f"warning-count={warning_count}\n")
               f.write(f"action={action}\n")
 
-          print(f"Security review generated. Critical issues: {critical_count}. Action: {action}")
+          print(f"Security review generated. Critical issues: {critical_count}. Warnings: {warning_count}. Action: {action}")
           PYEOF
 
       - name: Build security review body
         run: |
           ACTION="${{ steps.generate.outputs.action }}"
           CRITICAL_COUNT="${{ steps.generate.outputs.critical-count }}"
+          WARNING_COUNT="${{ steps.generate.outputs.warning-count }}"
 
           if [ "$ACTION" = "approve" ]; then
             BADGE="✅ **Security Patrol: Clear**"
           else
-            BADGE="🚨 **Security Issues Found** — ${CRITICAL_COUNT} critical issue(s) must be resolved before merge"
+            BADGE="🚨 **Security Issues Found** — ${CRITICAL_COUNT} critical / ${WARNING_COUNT} warning issue(s) must be resolved before merge"
           fi
 
           {
@@ -496,6 +526,7 @@ jobs:
             echo ""
             echo "**Action:** ${{ steps.generate.outputs.action }}"
             echo "**Critical issues:** ${{ steps.generate.outputs.critical-count }}"
+            echo "**Warnings:** ${{ steps.generate.outputs.warning-count }}"
             echo ""
             cat /tmp/security_review.txt
           } >> "$GITHUB_STEP_SUMMARY"
@@ -515,15 +546,19 @@ jobs:
         run: |
           REQUIRE_PASS="${{ needs.setup.outputs.require-security-pass }}"
           CRITICAL_COUNT="${{ needs.security-review.outputs.critical-count }}"
+          WARNING_COUNT="${{ needs.security-review.outputs.warning-count }}"
+          ACTION="${{ needs.security-review.outputs.action }}"
           REVIEW_RESULT="${{ needs.security-review.result }}"
           SKIP="${{ needs.setup.outputs.skip }}"
 
           echo "require-security-pass: ${REQUIRE_PASS}"
           echo "critical-count: ${CRITICAL_COUNT}"
+          echo "warning-count: ${WARNING_COUNT}"
+          echo "action: ${ACTION}"
           echo "security-review result: ${REVIEW_RESULT}"
           echo "skip-review label: ${SKIP}"
 
-          # Gate passes if: review was skipped, or not required, or no criticals
+          # Gate passes if: review was skipped, or not required, or review approved
           if [ "$SKIP" = "true" ]; then
             echo "✅ Security gate bypassed (skip-review label)"
             exit 0
@@ -534,12 +569,12 @@ jobs:
             exit 0
           fi
 
-          if [ -z "$CRITICAL_COUNT" ] || [ "$CRITICAL_COUNT" = "0" ]; then
-            echo "✅ Security gate passed — no critical issues"
+          if [ -n "$ACTION" ] && [ "$ACTION" = "approve" ]; then
+            echo "✅ Security gate passed — review action approved"
             exit 0
           fi
 
-          echo "❌ Security gate FAILED — ${CRITICAL_COUNT} critical security issue(s) must be resolved before merge"
+          echo "❌ Security gate FAILED — Cybill requested changes (critical: ${CRITICAL_COUNT:-0}, warnings: ${WARNING_COUNT:-0})"
           echo ""
           echo "See Cybill's Security Patrol comment on this PR for details."
           exit 1
@@ -548,14 +583,16 @@ jobs:
         if: always()
         run: |
           CRITICAL_COUNT="${{ needs.security-review.outputs.critical-count }}"
+          WARNING_COUNT="${{ needs.security-review.outputs.warning-count }}"
+          ACTION="${{ needs.security-review.outputs.action }}"
           {
             echo "## 🛡️ Security Gate"
             echo ""
-            if [ "${{ needs.security-review.result }}" = "success" ] && [ "${CRITICAL_COUNT:-0}" = "0" ]; then
+            if [ "${{ needs.security-review.result }}" = "success" ] && [ "${ACTION}" = "approve" ]; then
               echo "✅ Passed — yard is secure"
             elif [ "${{ needs.setup.outputs.skip }}" = "true" ]; then
               echo "⏭️ Skipped (skip-review label)"
             else
-              echo "❌ Failed — ${CRITICAL_COUNT} critical issue(s)"
+              echo "❌ Failed — critical: ${CRITICAL_COUNT:-0}, warnings: ${WARNING_COUNT:-0}"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
