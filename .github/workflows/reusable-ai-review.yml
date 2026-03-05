@@ -18,12 +18,14 @@
 #
 # Required repo/org secrets:
 #   ANTHROPIC_API_KEY           — Anthropic API key for Claude
+#   OPENAI_API_KEY              — (optional) OpenAI API key for Codex fallback
 #   TINKERBELLE_APP_ID          — (optional) GitHub App ID for formal reviews
 #   TINKERBELLE_APP_PRIVATE_KEY — (optional) GitHub App private key
 #
 # Optional inputs:
 #   enable-general-review: true
 #   enable-security-review: true
+#   review-provider-order: 'anthropic,openai'
 #   owners-file: 'OWNERS'
 #
 # OWNERS file (JSON, repo root) controls agent approval semantics.
@@ -55,6 +57,14 @@ on:
         description: 'Fail General Code Review check when Cybill requests changes'
         type: boolean
         default: false
+      review-provider-order:
+        description: 'Comma-separated provider fallback order. Supported: anthropic, openai'
+        type: string
+        default: 'anthropic,openai'
+      openai-model:
+        description: 'OpenAI model for fallback reviews'
+        type: string
+        default: 'gpt-5-codex'
       owners-file:
         description: 'Path to OWNERS file relative to repo root (JSON format)'
         type: string
@@ -68,6 +78,9 @@ on:
         required: false
       TINKERBELLE_APP_PRIVATE_KEY:
         description: 'TinkerBelle App for GitHub — private key (.pem contents). Required when app-id is provided.'
+        required: false
+      OPENAI_API_KEY:
+        description: 'OpenAI API key for Codex fallback reviews'
         required: false
 
 jobs:
@@ -163,6 +176,8 @@ jobs:
       critical-count: ${{ steps.generate.outputs.critical-count }}
       warning-count: ${{ steps.generate.outputs.warning-count }}
       action: ${{ steps.generate.outputs.action }}
+      provider: ${{ steps.generate.outputs.provider }}
+      provider: ${{ steps.generate.outputs.provider }}
 
     steps:
       - name: Checkout repository
@@ -189,9 +204,12 @@ jobs:
         id: generate
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TRUNCATED: ${{ steps.diff.outputs.truncated }}
           DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
           FAIL_ON_WARNINGS: ${{ inputs.fail-on-warnings }}
+          REVIEW_PROVIDER_ORDER: ${{ inputs.review-provider-order }}
+          OPENAI_MODEL: ${{ inputs.openai-model }}
         run: |
           python3 - <<'PYEOF'
           import json, os, sys, urllib.request, urllib.error
@@ -220,30 +238,91 @@ jobs:
           if truncated:
               user_content += f"\n\n> ⚠️ Diff was truncated (full diff: {diff_len} chars). Review what's visible."
 
-          payload = {
-              "model": "claude-sonnet-4-6",
-              "max_tokens": 1024,
-              "system": system_prompt,
-              "messages": [{"role": "user", "content": user_content}]
-          }
-
-          req = urllib.request.Request(
-              "https://api.anthropic.com/v1/messages",
-              data=json.dumps(payload).encode(),
-              headers={
-                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                  "anthropic-version": "2023-06-01",
-                  "content-type": "application/json",
-              },
-              method="POST",
-          )
-
-          try:
-              with urllib.request.urlopen(req) as resp:
+          def call_anthropic():
+              payload = {
+                  "model": "claude-sonnet-4-6",
+                  "max_tokens": 1024,
+                  "system": system_prompt,
+                  "messages": [{"role": "user", "content": user_content}],
+              }
+              req = urllib.request.Request(
+                  "https://api.anthropic.com/v1/messages",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                      "anthropic-version": "2023-06-01",
+                      "content-type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
                   body = json.loads(resp.read())
-                  review_text = body["content"][0]["text"]
-          except urllib.error.HTTPError as e:
-              print(f"Anthropic API error {e.code}: {e.read().decode()}", file=sys.stderr)
+              return body["content"][0]["text"]
+
+          def extract_openai_output_text(body):
+              if isinstance(body, dict) and isinstance(body.get("output_text"), str) and body["output_text"].strip():
+                  return body["output_text"]
+              parts = []
+              for item in body.get("output", []):
+                  if item.get("type") != "message":
+                      continue
+                  for c in item.get("content", []):
+                      text_val = c.get("text")
+                      if isinstance(text_val, str) and text_val.strip():
+                          parts.append(text_val)
+              text = "\n".join(parts).strip()
+              if not text:
+                  raise RuntimeError("OpenAI response contained no text output")
+              return text
+
+          def call_openai():
+              payload = {
+                  "model": os.environ.get("OPENAI_MODEL", "gpt-5-codex"),
+                  "input": [
+                      {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                      {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
+                  ],
+                  "max_output_tokens": 1024,
+              }
+              req = urllib.request.Request(
+                  "https://api.openai.com/v1/responses",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+                      "content-type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  body = json.loads(resp.read())
+              return extract_openai_output_text(body)
+
+          provider_order = [p.strip().lower() for p in os.environ.get("REVIEW_PROVIDER_ORDER", "anthropic,openai").split(",") if p.strip()]
+          review_text = None
+          used_provider = None
+          errors = []
+
+          for provider in provider_order:
+              try:
+                  if provider == "anthropic":
+                      if not os.environ.get("ANTHROPIC_API_KEY"):
+                          raise RuntimeError("ANTHROPIC_API_KEY missing")
+                      review_text = call_anthropic()
+                  elif provider == "openai":
+                      if not os.environ.get("OPENAI_API_KEY"):
+                          raise RuntimeError("OPENAI_API_KEY missing")
+                      review_text = call_openai()
+                  else:
+                      raise RuntimeError(f"unsupported provider '{provider}'")
+                  used_provider = provider
+                  break
+              except Exception as e:
+                  errors.append(f"{provider}: {e}")
+
+          if not review_text:
+              print("All review providers failed:", file=sys.stderr)
+              for err in errors:
+                  print(f" - {err}", file=sys.stderr)
               sys.exit(1)
 
           with open("/tmp/review.txt", "w") as f:
@@ -258,8 +337,12 @@ jobs:
               f.write(f"critical-count={critical_count}\n")
               f.write(f"warning-count={warning_count}\n")
               f.write(f"action={action}\n")
+              f.write(f"provider={used_provider}\n")
 
-          print(f"Review generated. Critical issues: {critical_count}. Warnings: {warning_count}. Action: {action}")
+          print(
+              f"Review generated via {used_provider}. "
+              f"Critical issues: {critical_count}. Warnings: {warning_count}. Action: {action}"
+          )
           PYEOF
 
       - name: Build review body
@@ -320,6 +403,7 @@ jobs:
             echo "## 🐾 Cybill's Code Review"
             echo ""
             echo "**Action:** ${{ steps.generate.outputs.action }}"
+            echo "**Provider:** ${{ steps.generate.outputs.provider }}"
             echo "**Critical issues:** ${{ steps.generate.outputs.critical-count }}"
             echo "**Warnings:** ${{ steps.generate.outputs.warning-count }}"
             echo "**Mode:** ${{ needs.setup.outputs.has-bot-token == 'true' && needs.setup.outputs.agent-can-approve == 'true' && 'formal review' || 'comment' }}"
@@ -374,9 +458,12 @@ jobs:
         id: generate
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TRUNCATED: ${{ steps.diff.outputs.truncated }}
           DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
           FAIL_ON_WARNINGS: ${{ inputs.fail-on-warnings }}
+          REVIEW_PROVIDER_ORDER: ${{ inputs.review-provider-order }}
+          OPENAI_MODEL: ${{ inputs.openai-model }}
         run: |
           python3 - <<'PYEOF'
           import json, os, sys, urllib.request, urllib.error
@@ -422,30 +509,91 @@ jobs:
           if truncated:
               user_content += f"\n\n> ⚠️ Diff was truncated (full diff: {diff_len} chars). Review what's visible."
 
-          payload = {
-              "model": "claude-sonnet-4-6",
-              "max_tokens": 1024,
-              "system": system_prompt,
-              "messages": [{"role": "user", "content": user_content}]
-          }
-
-          req = urllib.request.Request(
-              "https://api.anthropic.com/v1/messages",
-              data=json.dumps(payload).encode(),
-              headers={
-                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                  "anthropic-version": "2023-06-01",
-                  "content-type": "application/json",
-              },
-              method="POST",
-          )
-
-          try:
-              with urllib.request.urlopen(req) as resp:
+          def call_anthropic():
+              payload = {
+                  "model": "claude-sonnet-4-6",
+                  "max_tokens": 1024,
+                  "system": system_prompt,
+                  "messages": [{"role": "user", "content": user_content}],
+              }
+              req = urllib.request.Request(
+                  "https://api.anthropic.com/v1/messages",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                      "anthropic-version": "2023-06-01",
+                      "content-type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
                   body = json.loads(resp.read())
-                  review_text = body["content"][0]["text"]
-          except urllib.error.HTTPError as e:
-              print(f"Anthropic API error {e.code}: {e.read().decode()}", file=sys.stderr)
+              return body["content"][0]["text"]
+
+          def extract_openai_output_text(body):
+              if isinstance(body, dict) and isinstance(body.get("output_text"), str) and body["output_text"].strip():
+                  return body["output_text"]
+              parts = []
+              for item in body.get("output", []):
+                  if item.get("type") != "message":
+                      continue
+                  for c in item.get("content", []):
+                      text_val = c.get("text")
+                      if isinstance(text_val, str) and text_val.strip():
+                          parts.append(text_val)
+              text = "\n".join(parts).strip()
+              if not text:
+                  raise RuntimeError("OpenAI response contained no text output")
+              return text
+
+          def call_openai():
+              payload = {
+                  "model": os.environ.get("OPENAI_MODEL", "gpt-5-codex"),
+                  "input": [
+                      {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                      {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
+                  ],
+                  "max_output_tokens": 1024,
+              }
+              req = urllib.request.Request(
+                  "https://api.openai.com/v1/responses",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+                      "content-type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  body = json.loads(resp.read())
+              return extract_openai_output_text(body)
+
+          provider_order = [p.strip().lower() for p in os.environ.get("REVIEW_PROVIDER_ORDER", "anthropic,openai").split(",") if p.strip()]
+          review_text = None
+          used_provider = None
+          errors = []
+
+          for provider in provider_order:
+              try:
+                  if provider == "anthropic":
+                      if not os.environ.get("ANTHROPIC_API_KEY"):
+                          raise RuntimeError("ANTHROPIC_API_KEY missing")
+                      review_text = call_anthropic()
+                  elif provider == "openai":
+                      if not os.environ.get("OPENAI_API_KEY"):
+                          raise RuntimeError("OPENAI_API_KEY missing")
+                      review_text = call_openai()
+                  else:
+                      raise RuntimeError(f"unsupported provider '{provider}'")
+                  used_provider = provider
+                  break
+              except Exception as e:
+                  errors.append(f"{provider}: {e}")
+
+          if not review_text:
+              print("All review providers failed:", file=sys.stderr)
+              for err in errors:
+                  print(f" - {err}", file=sys.stderr)
               sys.exit(1)
 
           with open("/tmp/security_review.txt", "w") as f:
@@ -460,8 +608,12 @@ jobs:
               f.write(f"critical-count={critical_count}\n")
               f.write(f"warning-count={warning_count}\n")
               f.write(f"action={action}\n")
+              f.write(f"provider={used_provider}\n")
 
-          print(f"Security review generated. Critical issues: {critical_count}. Warnings: {warning_count}. Action: {action}")
+          print(
+              f"Security review generated via {used_provider}. "
+              f"Critical issues: {critical_count}. Warnings: {warning_count}. Action: {action}"
+          )
           PYEOF
 
       - name: Build security review body
@@ -525,6 +677,7 @@ jobs:
             echo "## 🐾 Cybill's Security Patrol"
             echo ""
             echo "**Action:** ${{ steps.generate.outputs.action }}"
+            echo "**Provider:** ${{ steps.generate.outputs.provider }}"
             echo "**Critical issues:** ${{ steps.generate.outputs.critical-count }}"
             echo "**Warnings:** ${{ steps.generate.outputs.warning-count }}"
             echo ""
