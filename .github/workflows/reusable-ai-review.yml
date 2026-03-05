@@ -14,10 +14,12 @@
 #   jobs:
 #     ai-review:
 #       uses: escape-velocity-ventures/workflow-templates/.github/workflows/reusable-ai-review.yml@main
-#       secrets:
-#         anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-#         app-id: ${{ secrets.TINKERBELLE_APP_ID }}                # optional, enables formal reviews
-#         app-private-key: ${{ secrets.TINKERBELLE_APP_PRIVATE_KEY }}  # optional, enables formal reviews
+#       secrets: inherit
+#
+# Required repo/org secrets:
+#   ANTHROPIC_API_KEY           — Anthropic API key for Claude
+#   TINKERBELLE_APP_ID          — (optional) GitHub App ID for formal reviews
+#   TINKERBELLE_APP_PRIVATE_KEY — (optional) GitHub App private key
 #
 # Optional inputs:
 #   enable-general-review: true
@@ -50,13 +52,13 @@ on:
         type: string
         default: 'OWNERS'
     secrets:
-      anthropic-api-key:
+      ANTHROPIC_API_KEY:
         description: 'Anthropic API key for Claude'
         required: true
-      app-id:
+      TINKERBELLE_APP_ID:
         description: 'TinkerBelle App for GitHub — numeric App ID. Enables formal approve/request-changes reviews. Without this, falls back to comment-only.'
         required: false
-      app-private-key:
+      TINKERBELLE_APP_PRIVATE_KEY:
         description: 'TinkerBelle App for GitHub — private key (.pem contents). Required when app-id is provided.'
         required: false
 
@@ -137,8 +139,8 @@ jobs:
             echo "App credentials: not configured — comment-only mode"
           fi
         env:
-          APP_ID: ${{ secrets.app-id }}
-          APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
+          APP_ID: ${{ secrets.TINKERBELLE_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.TINKERBELLE_APP_PRIVATE_KEY }}
 
   # ── General Code Review ───────────────────────────────────────────────────
   general-review:
@@ -184,7 +186,7 @@ jobs:
       - name: Generate review
         id: generate
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.anthropic-api-key }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TRUNCATED: ${{ steps.diff.outputs.truncated }}
           DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
         run: |
@@ -281,8 +283,8 @@ jobs:
         if: needs.setup.outputs.agent-can-approve == 'true' && needs.setup.outputs.has-bot-token == 'true'
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.app-id }}
-          private-key: ${{ secrets.app-private-key }}
+          app-id: ${{ secrets.TINKERBELLE_APP_ID }}
+          private-key: ${{ secrets.TINKERBELLE_APP_PRIVATE_KEY }}
 
       - name: Submit formal review
         if: needs.setup.outputs.agent-can-approve == 'true' && needs.setup.outputs.has-bot-token == 'true'
@@ -358,7 +360,7 @@ jobs:
       - name: Generate security review
         id: generate
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.anthropic-api-key }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TRUNCATED: ${{ steps.diff.outputs.truncated }}
           DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
         run: |
@@ -475,8 +477,8 @@ jobs:
         if: needs.setup.outputs.agent-can-approve == 'true' && needs.setup.outputs.has-bot-token == 'true'
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.app-id }}
-          private-key: ${{ secrets.app-private-key }}
+          app-id: ${{ secrets.TINKERBELLE_APP_ID }}
+          private-key: ${{ secrets.TINKERBELLE_APP_PRIVATE_KEY }}
 
       - name: Submit formal security review
         if: needs.setup.outputs.agent-can-approve == 'true' && needs.setup.outputs.has-bot-token == 'true'
