@@ -19,13 +19,14 @@
 # Required repo/org secrets:
 #   ANTHROPIC_API_KEY           — Anthropic API key for Claude
 #   OPENAI_API_KEY              — (optional) OpenAI API key for Codex fallback
+#   XAI_API_KEY                 — (optional) xAI API key for Grok fallback
 #   TINKERBELLE_APP_ID          — (optional) GitHub App ID for formal reviews
 #   TINKERBELLE_APP_PRIVATE_KEY — (optional) GitHub App private key
 #
 # Optional inputs:
 #   enable-general-review: true
 #   enable-security-review: true
-#   review-provider-order: 'anthropic,openai'
+#   review-provider-order: 'anthropic,openai,xai'
 #   owners-file: 'OWNERS'
 #
 # OWNERS file (JSON, repo root) controls agent approval semantics.
@@ -58,13 +59,17 @@ on:
         type: boolean
         default: false
       review-provider-order:
-        description: 'Comma-separated provider fallback order. Supported: anthropic, openai'
+        description: 'Comma-separated provider fallback order. Supported: anthropic, openai, xai'
         type: string
-        default: 'anthropic,openai'
+        default: 'anthropic,openai,xai'
       openai-model:
         description: 'OpenAI model for fallback reviews'
         type: string
         default: 'gpt-5-codex'
+      xai-model:
+        description: 'xAI model for Grok fallback reviews'
+        type: string
+        default: 'grok-4-1-fast-reasoning'
       owners-file:
         description: 'Path to OWNERS file relative to repo root (JSON format)'
         type: string
@@ -81,6 +86,9 @@ on:
         required: false
       OPENAI_API_KEY:
         description: 'OpenAI API key for Codex fallback reviews'
+        required: false
+      XAI_API_KEY:
+        description: 'xAI API key for Grok fallback reviews'
         required: false
 
 jobs:
@@ -204,11 +212,13 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           TRUNCATED: ${{ steps.diff.outputs.truncated }}
           DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
           FAIL_ON_WARNINGS: ${{ inputs.fail-on-warnings }}
           REVIEW_PROVIDER_ORDER: ${{ inputs.review-provider-order }}
           OPENAI_MODEL: ${{ inputs.openai-model }}
+          XAI_MODEL: ${{ inputs.xai-model }}
         run: |
           python3 - <<'PYEOF'
           import json, os, sys, urllib.request, urllib.error
@@ -296,7 +306,38 @@ jobs:
                   body = json.loads(resp.read())
               return extract_openai_output_text(body)
 
-          provider_order = [p.strip().lower() for p in os.environ.get("REVIEW_PROVIDER_ORDER", "anthropic,openai").split(",") if p.strip()]
+          def call_xai():
+              payload = {
+                  "model": os.environ.get("XAI_MODEL", "grok-4-1-fast-reasoning"),
+                  "messages": [
+                      {"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_content},
+                  ],
+                  "max_tokens": 1024,
+              }
+              req = urllib.request.Request(
+                  "https://api.x.ai/v1/chat/completions",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {os.environ['XAI_API_KEY']}",
+                      "content-type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  body = json.loads(resp.read())
+              choices = body.get("choices", [])
+              if not choices:
+                  raise RuntimeError("xAI response missing choices")
+              content = choices[0].get("message", {}).get("content")
+              if isinstance(content, list):
+                  parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+                  content = "\n".join([p for p in parts if p]).strip()
+              if not isinstance(content, str) or not content.strip():
+                  raise RuntimeError("xAI response contained no text output")
+              return content
+
+          provider_order = [p.strip().lower() for p in os.environ.get("REVIEW_PROVIDER_ORDER", "anthropic,openai,xai").split(",") if p.strip()]
           review_text = None
           used_provider = None
           errors = []
@@ -311,6 +352,10 @@ jobs:
                       if not os.environ.get("OPENAI_API_KEY"):
                           raise RuntimeError("OPENAI_API_KEY missing")
                       review_text = call_openai()
+                  elif provider == "xai":
+                      if not os.environ.get("XAI_API_KEY"):
+                          raise RuntimeError("XAI_API_KEY missing")
+                      review_text = call_xai()
                   else:
                       raise RuntimeError(f"unsupported provider '{provider}'")
                   used_provider = provider
@@ -459,11 +504,13 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           TRUNCATED: ${{ steps.diff.outputs.truncated }}
           DIFF_LEN: ${{ steps.diff.outputs.diff_len }}
           FAIL_ON_WARNINGS: ${{ inputs.fail-on-warnings }}
           REVIEW_PROVIDER_ORDER: ${{ inputs.review-provider-order }}
           OPENAI_MODEL: ${{ inputs.openai-model }}
+          XAI_MODEL: ${{ inputs.xai-model }}
         run: |
           python3 - <<'PYEOF'
           import json, os, sys, urllib.request, urllib.error
@@ -568,7 +615,38 @@ jobs:
                   body = json.loads(resp.read())
               return extract_openai_output_text(body)
 
-          provider_order = [p.strip().lower() for p in os.environ.get("REVIEW_PROVIDER_ORDER", "anthropic,openai").split(",") if p.strip()]
+          def call_xai():
+              payload = {
+                  "model": os.environ.get("XAI_MODEL", "grok-4-1-fast-reasoning"),
+                  "messages": [
+                      {"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_content},
+                  ],
+                  "max_tokens": 1024,
+              }
+              req = urllib.request.Request(
+                  "https://api.x.ai/v1/chat/completions",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {os.environ['XAI_API_KEY']}",
+                      "content-type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  body = json.loads(resp.read())
+              choices = body.get("choices", [])
+              if not choices:
+                  raise RuntimeError("xAI response missing choices")
+              content = choices[0].get("message", {}).get("content")
+              if isinstance(content, list):
+                  parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+                  content = "\n".join([p for p in parts if p]).strip()
+              if not isinstance(content, str) or not content.strip():
+                  raise RuntimeError("xAI response contained no text output")
+              return content
+
+          provider_order = [p.strip().lower() for p in os.environ.get("REVIEW_PROVIDER_ORDER", "anthropic,openai,xai").split(",") if p.strip()]
           review_text = None
           used_provider = None
           errors = []
@@ -583,6 +661,10 @@ jobs:
                       if not os.environ.get("OPENAI_API_KEY"):
                           raise RuntimeError("OPENAI_API_KEY missing")
                       review_text = call_openai()
+                  elif provider == "xai":
+                      if not os.environ.get("XAI_API_KEY"):
+                          raise RuntimeError("XAI_API_KEY missing")
+                      review_text = call_xai()
                   else:
                       raise RuntimeError(f"unsupported provider '{provider}'")
                   used_provider = provider
