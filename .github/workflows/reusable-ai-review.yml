@@ -196,12 +196,57 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get PR diff
-        id: diff
+      - name: Resolve PR context
+        id: pr-context
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
-          PR_NUMBER=${{ github.event.pull_request.number }}
+          python3 - <<'PYEOF'
+          import json, os, urllib.request
+
+          repo = os.environ["REPO"]
+          event_pr = (os.environ.get("EVENT_PR_NUMBER") or "").strip()
+          event_head = (os.environ.get("EVENT_HEAD_SHA") or "").strip()
+          fallback_sha = (os.environ.get("GITHUB_SHA") or "").strip()
+
+          pr_number = event_pr
+          head_sha = event_head or fallback_sha
+
+          if not pr_number and head_sha:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/commits/{head_sha}/pulls",
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  pulls = json.loads(resp.read())
+              if pulls:
+                  open_pulls = [p for p in pulls if p.get("state") == "open"]
+                  pick = open_pulls[0] if open_pulls else pulls[0]
+                  pr_number = str(pick.get("number") or "")
+                  if not event_head:
+                      head_sha = (pick.get("head") or {}).get("sha") or head_sha
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"pr-number={pr_number}\n")
+              f.write(f"head-sha={head_sha}\n")
+              f.write(f"has-pr-context={'true' if pr_number else 'false'}\n")
+          PYEOF
+
+      - name: Get PR diff
+        id: diff
+        if: steps.pr-context.outputs.has-pr-context == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr-number }}
+        run: |
           echo "Fetching diff for PR #${PR_NUMBER}..."
 
           RAW_DIFF=$(gh pr diff "${PR_NUMBER}" --repo "${{ github.repository }}" 2>&1)
@@ -216,8 +261,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr-number }}
+          HEAD_SHA: ${{ steps.pr-context.outputs.head-sha }}
           CONSTRAIN: ${{ inputs.constrain-to-prior-findings }}
         run: |
           python3 - <<'PYEOF'
@@ -231,8 +276,12 @@ jobs:
               sys.exit(0)
 
           repo = os.environ["REPO"]
-          pr = os.environ["PR_NUMBER"]
-          head_sha = os.environ["HEAD_SHA"]
+          pr = (os.environ.get("PR_NUMBER") or "").strip()
+          head_sha = (os.environ.get("HEAD_SHA") or "").strip()
+          if not pr:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("has-prior-findings=false\n")
+              sys.exit(0)
           req = urllib.request.Request(
               f"https://api.github.com/repos/{repo}/pulls/{pr}/reviews?per_page=100",
               headers={
@@ -274,6 +323,7 @@ jobs:
 
       - name: Generate review
         id: generate
+        if: steps.pr-context.outputs.has-pr-context == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -478,6 +528,12 @@ jobs:
           )
           PYEOF
 
+      - name: Fail if no PR context
+        if: steps.pr-context.outputs.has-pr-context != 'true'
+        run: |
+          echo "Unable to resolve PR context for this run (event=${{ github.event_name }}, sha=${{ github.sha }})." >&2
+          exit 1
+
       - name: Build review body
         run: |
           ACTION="${{ steps.generate.outputs.action }}"
@@ -577,12 +633,57 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get PR diff
-        id: diff
+      - name: Resolve PR context
+        id: pr-context
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
-          PR_NUMBER=${{ github.event.pull_request.number }}
+          python3 - <<'PYEOF'
+          import json, os, urllib.request
+
+          repo = os.environ["REPO"]
+          event_pr = (os.environ.get("EVENT_PR_NUMBER") or "").strip()
+          event_head = (os.environ.get("EVENT_HEAD_SHA") or "").strip()
+          fallback_sha = (os.environ.get("GITHUB_SHA") or "").strip()
+
+          pr_number = event_pr
+          head_sha = event_head or fallback_sha
+
+          if not pr_number and head_sha:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/commits/{head_sha}/pulls",
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  pulls = json.loads(resp.read())
+              if pulls:
+                  open_pulls = [p for p in pulls if p.get("state") == "open"]
+                  pick = open_pulls[0] if open_pulls else pulls[0]
+                  pr_number = str(pick.get("number") or "")
+                  if not event_head:
+                      head_sha = (pick.get("head") or {}).get("sha") or head_sha
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"pr-number={pr_number}\n")
+              f.write(f"head-sha={head_sha}\n")
+              f.write(f"has-pr-context={'true' if pr_number else 'false'}\n")
+          PYEOF
+
+      - name: Get PR diff
+        id: diff
+        if: steps.pr-context.outputs.has-pr-context == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr-number }}
+        run: |
           RAW_DIFF=$(gh pr diff "${PR_NUMBER}" --repo "${{ github.repository }}" 2>&1)
           DIFF_LEN=${#RAW_DIFF}
           echo "${RAW_DIFF}" > /tmp/pr_diff.txt
@@ -595,8 +696,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr-number }}
+          HEAD_SHA: ${{ steps.pr-context.outputs.head-sha }}
           CONSTRAIN: ${{ inputs.constrain-to-prior-findings }}
         run: |
           python3 - <<'PYEOF'
@@ -610,8 +711,12 @@ jobs:
               sys.exit(0)
 
           repo = os.environ["REPO"]
-          pr = os.environ["PR_NUMBER"]
-          head_sha = os.environ["HEAD_SHA"]
+          pr = (os.environ.get("PR_NUMBER") or "").strip()
+          head_sha = (os.environ.get("HEAD_SHA") or "").strip()
+          if not pr:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("has-prior-findings=false\n")
+              sys.exit(0)
           req = urllib.request.Request(
               f"https://api.github.com/repos/{repo}/pulls/{pr}/reviews?per_page=100",
               headers={
@@ -653,6 +758,7 @@ jobs:
 
       - name: Generate security review
         id: generate
+        if: steps.pr-context.outputs.has-pr-context == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -873,6 +979,12 @@ jobs:
               f"Critical issues: {critical_count}. Warnings: {warning_count}. Action: {action}"
           )
           PYEOF
+
+      - name: Fail if no PR context
+        if: steps.pr-context.outputs.has-pr-context != 'true'
+        run: |
+          echo "Unable to resolve PR context for this run (event=${{ github.event_name }}, sha=${{ github.sha }})." >&2
+          exit 1
 
       - name: Build security review body
         run: |
