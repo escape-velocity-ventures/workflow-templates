@@ -310,8 +310,8 @@ jobs:
           has_prior = bool(candidates)
           if has_prior:
               submitted, body, commit_id = sorted(candidates, key=lambda x: x[0])[-1]
-              if len(body) > 12000:
-                  body = body[:12000] + "\n\n[truncated prior review context]"
+              if len(body) > 30000:
+                  body = body[:30000] + "\n\n[truncated prior review context]"
               with open(out_path, "w") as f:
                   f.write(body)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
@@ -389,7 +389,7 @@ jobs:
           def call_anthropic():
               payload = {
                   "model": "claude-sonnet-4-6",
-                  "max_tokens": 1024,
+                  "max_tokens": 2048,
                   "system": system_prompt,
                   "messages": [{"role": "user", "content": user_content}],
               }
@@ -430,7 +430,7 @@ jobs:
                       {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                       {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
                   ],
-                  "max_output_tokens": 1024,
+                  "max_output_tokens": 2048,
               }
               req = urllib.request.Request(
                   "https://api.openai.com/v1/responses",
@@ -452,7 +452,7 @@ jobs:
                       {"role": "system", "content": system_prompt},
                       {"role": "user", "content": user_content},
                   ],
-                  "max_tokens": 1024,
+                  "max_tokens": 2048,
               }
               req = urllib.request.Request(
                   "https://api.x.ai/v1/chat/completions",
@@ -765,8 +765,8 @@ jobs:
           has_prior = bool(candidates)
           if has_prior:
               submitted, body, commit_id = sorted(candidates, key=lambda x: x[0])[-1]
-              if len(body) > 12000:
-                  body = body[:12000] + "\n\n[truncated prior review context]"
+              if len(body) > 30000:
+                  body = body[:30000] + "\n\n[truncated prior review context]"
               with open(out_path, "w") as f:
                   f.write(body)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
@@ -861,7 +861,7 @@ jobs:
           def call_anthropic():
               payload = {
                   "model": "claude-sonnet-4-6",
-                  "max_tokens": 1024,
+                  "max_tokens": 2048,
                   "system": system_prompt,
                   "messages": [{"role": "user", "content": user_content}],
               }
@@ -902,7 +902,7 @@ jobs:
                       {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                       {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
                   ],
-                  "max_output_tokens": 1024,
+                  "max_output_tokens": 2048,
               }
               req = urllib.request.Request(
                   "https://api.openai.com/v1/responses",
@@ -924,7 +924,7 @@ jobs:
                       {"role": "system", "content": system_prompt},
                       {"role": "user", "content": user_content},
                   ],
-                  "max_tokens": 1024,
+                  "max_tokens": 2048,
               }
               req = urllib.request.Request(
                   "https://api.x.ai/v1/chat/completions",
