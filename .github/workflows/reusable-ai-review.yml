@@ -511,8 +511,28 @@ jobs:
           with open("/tmp/review.txt", "w") as f:
               f.write(review_text)
 
-          critical_count = review_text.count("🔴")
-          warning_count = review_text.count("🟡")
+          def unresolved_count(text: str, marker: str) -> int:
+              lines = text.splitlines()
+              count = 0
+              for i, line in enumerate(lines):
+                  if marker not in line:
+                      continue
+                  if "Changes Requested by Cybill" in line:
+                      continue
+                  window = "\n".join(lines[i:i + 8]).lower()
+                  if "status:" in window:
+                      if "unresolved" in window:
+                          count += 1
+                      elif "resolved" in window:
+                          continue
+                      else:
+                          count += 1
+                  else:
+                      count += 1
+              return count
+
+          critical_count = unresolved_count(review_text, "🔴")
+          warning_count = unresolved_count(review_text, "🟡")
           fail_on_warnings = os.environ.get("FAIL_ON_WARNINGS", "false") == "true"
           action = "request-changes" if (critical_count > 0 or (fail_on_warnings and warning_count > 0)) else "approve"
 
@@ -963,8 +983,28 @@ jobs:
           with open("/tmp/security_review.txt", "w") as f:
               f.write(review_text)
 
-          critical_count = review_text.count("🔴")
-          warning_count = review_text.count("🟡")
+          def unresolved_count(text: str, marker: str) -> int:
+              lines = text.splitlines()
+              count = 0
+              for i, line in enumerate(lines):
+                  if marker not in line:
+                      continue
+                  if "Security Issues Found" in line:
+                      continue
+                  window = "\n".join(lines[i:i + 8]).lower()
+                  if "status:" in window:
+                      if "unresolved" in window:
+                          count += 1
+                      elif "resolved" in window:
+                          continue
+                      else:
+                          count += 1
+                  else:
+                      count += 1
+              return count
+
+          critical_count = unresolved_count(review_text, "🔴")
+          warning_count = unresolved_count(review_text, "🟡")
           fail_on_warnings = os.environ.get("FAIL_ON_WARNINGS", "false") == "true"
           action = "request-changes" if (critical_count > 0 or (fail_on_warnings and warning_count > 0)) else "approve"
 
