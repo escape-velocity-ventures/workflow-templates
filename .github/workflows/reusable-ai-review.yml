@@ -517,8 +517,15 @@ jobs:
               for i, line in enumerate(lines):
                   if marker not in line:
                       continue
+                  # Skip badge/summary lines
                   if "Changes Requested by Cybill" in line:
                       continue
+                  # Skip section headers (e.g., "### 🔴 CRITICAL") — these are formatting,
+                  # not individual findings. Check if the section body says "None detected".
+                  if line.strip().startswith("#"):
+                      lookahead = "\n".join(lines[i+1:i+5]).lower()
+                      if any(p in lookahead for p in ["none detected", "none found", "no issues", "no intruders", "yard is secure"]):
+                          continue
                   window = "\n".join(lines[i:i + 8]).lower()
                   if "status:" in window:
                       if "unresolved" in window:
@@ -989,8 +996,15 @@ jobs:
               for i, line in enumerate(lines):
                   if marker not in line:
                       continue
+                  # Skip badge/summary lines
                   if "Security Issues Found" in line:
                       continue
+                  # Skip section headers (e.g., "### 🔴 CRITICAL") — these are formatting,
+                  # not individual findings. Check if the section body says "None detected".
+                  if line.strip().startswith("#"):
+                      lookahead = "\n".join(lines[i+1:i+5]).lower()
+                      if any(p in lookahead for p in ["none detected", "none found", "no issues", "no intruders", "yard is secure"]):
+                          continue
                   window = "\n".join(lines[i:i + 8]).lower()
                   if "status:" in window:
                       if "unresolved" in window:
