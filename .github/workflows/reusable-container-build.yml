@@ -5,6 +5,8 @@
 # This reusable workflow ensures all container images are built for both
 # amd64 and arm64 architectures, preventing platform mismatch errors.
 #
+# Supports both GitHub Actions (GHCR) and Gitea Actions (DinD) runners.
+#
 # Usage in other workflows:
 #
 #   jobs:
@@ -60,9 +62,60 @@ on:
         required: false
         type: string
         default: ''
+      buildkitd-config:
+        description: 'Buildx BuildKit config (e.g. insecure registries, mirrors)'
+        required: false
+        type: string
+        default: ''
+      install-docker-cli:
+        description: 'Install Docker CLI in DinD environments'
+        required: false
+        type: boolean
+        default: false
+      docker-version:
+        description: 'Docker CLI version when install-docker-cli is true'
+        required: false
+        type: string
+        default: '27.5.1'
+      cache-type:
+        description: 'Cache backend: gha or registry'
+        required: false
+        type: string
+        default: 'gha'
+      cache-ref:
+        description: 'Registry ref for cache (when cache-type=registry)'
+        required: false
+        type: string
+        default: ''
+      download-artifact:
+        description: 'Artifact name to download before build (empty = skip)'
+        required: false
+        type: string
+        default: ''
+      artifact-path:
+        description: 'Where to extract the downloaded artifact'
+        required: false
+        type: string
+        default: '.'
+    outputs:
+      image-tag:
+        description: 'Short SHA image tag (7 chars)'
+        value: ${{ jobs.build-and-push.outputs.image-tag }}
+      image-digest:
+        description: 'Image digest from build'
+        value: ${{ jobs.build-and-push.outputs.image-digest }}
+      image-tags:
+        description: 'All image tags (newline-separated)'
+        value: ${{ jobs.build-and-push.outputs.image-tags }}
     secrets:
       github-token:
         description: 'GitHub token for registry authentication (optional — falls back to github.token)'
+        required: false
+      registry-user:
+        description: 'Explicit registry username (for DinD/Gitea)'
+        required: false
+      registry-password:
+        description: 'Explicit registry password (for DinD/Gitea)'
         required: false
 
 jobs:
@@ -110,6 +163,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Download build artifact
+        if: inputs.download-artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.download-artifact }}
+          path: ${{ inputs.artifact-path }}
+
+      - name: Install Docker CLI
+        if: inputs.install-docker-cli
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            aarch64|arm64) DOCKER_ARCH="aarch64" ;;
+            *) DOCKER_ARCH="x86_64" ;;
+          esac
+          for i in 1 2 3; do
+            if curl -fsSL --connect-timeout 30 --retry 3 \
+              "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${{ inputs.docker-version }}.tgz" -o /tmp/docker.tgz; then
+              break
+            fi
+            echo "Download attempt $i failed, retrying..."
+            sleep 5
+          done
+          tar xzf /tmp/docker.tgz -C /tmp
+          mv /tmp/docker/docker /usr/local/bin/docker
+          chmod +x /usr/local/bin/docker
+          rm -rf /tmp/docker /tmp/docker.tgz
+          docker version || echo "Docker CLI installed (daemon check may fail without socket)"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -117,14 +199,16 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: ${{ inputs.buildkitd-config }}
 
       - name: Log in to Container Registry
         if: inputs.push && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ inputs.registry }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.github-token || github.token }}
+          username: ${{ secrets.registry-user || github.actor }}
+          password: ${{ secrets.registry-password || secrets.github-token || github.token }}
 
       - name: Extract metadata
         id: meta
@@ -138,6 +222,10 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             ${{ inputs.extra-tags }}
 
+      - name: Compute immutable image tag
+        id: sha
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v5
@@ -148,8 +236,8 @@ jobs:
           push: ${{ inputs.push && github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: ${{ inputs.cache-type == 'registry' && format('type=registry,ref={0}', inputs.cache-ref) || 'type=gha' }}
+          cache-to: ${{ inputs.cache-type == 'registry' && format('type=registry,ref={0},mode=max', inputs.cache-ref) || 'type=gha,mode=max' }}
 
       - name: Verify multi-arch manifest
         if: inputs.push && github.event_name != 'pull_request'
@@ -175,5 +263,6 @@ jobs:
           fi
 
     outputs:
+      image-tag: ${{ steps.sha.outputs.tag }}
       image-digest: ${{ steps.build.outputs.digest }}
       image-tags: ${{ steps.meta.outputs.tags }}
