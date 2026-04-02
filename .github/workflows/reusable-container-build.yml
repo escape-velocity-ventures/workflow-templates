@@ -1,11 +1,16 @@
 # Reusable Container Build Workflow
-# Purpose: Enforce multi-arch builds (linux/amd64,linux/arm64) as default
+# Purpose: Build and push container images using plain `docker build` (Podman-compatible)
 # Created: 2026-01-22 as remediation for POST-MORTEM-2026-01-22
+# Updated: 2026-04-02 — replaced buildx/QEMU with plain docker build
 #
-# This reusable workflow ensures all container images are built for both
-# amd64 and arm64 architectures, preventing platform mismatch errors.
+# POST-MORTEM-2026-01-22 originally required multi-arch (amd64+arm64) builds.
+# As of 2026-04-02, the cluster is 100% ARM64 (7/7 nodes). Multi-arch is no
+# longer needed. Buildx's docker-container driver is incompatible with Podman's
+# Docker socket ("cannot set cgroup parent if not creating cgroups"), which is
+# the container runtime on all Gitea Actions runners.
 #
-# Supports both GitHub Actions (GHCR) and Gitea Actions (DinD) runners.
+# If the cluster ever adds amd64 nodes, re-evaluate multi-arch builds.
+# The plain `docker build` approach builds natively for the runner's architecture.
 #
 # Usage in other workflows:
 #
@@ -15,7 +20,7 @@
 #       with:
 #         image-name: my-service
 #         context: ./src
-#         dockerfile: ./src/Dockerfile   # path relative to repo root
+#         dockerfile: ./src/Dockerfile
 #       secrets: inherit
 
 name: Reusable Container Build
@@ -37,11 +42,6 @@ on:
         required: false
         type: string
         default: 'Dockerfile'
-      platforms:
-        description: 'Target platforms (default: linux/amd64,linux/arm64 - REQUIRED FOR PRODUCTION)'
-        required: false
-        type: string
-        default: 'linux/amd64,linux/arm64'
       push:
         description: 'Push to registry (default: true for non-PR)'
         required: false
@@ -58,12 +58,7 @@ on:
         type: string
         default: 'escape-velocity-ventures'
       extra-tags:
-        description: 'Additional tags (newline-separated)'
-        required: false
-        type: string
-        default: ''
-      buildkitd-config:
-        description: 'Buildx BuildKit config (e.g. insecure registries, mirrors)'
+        description: 'Additional tags (space-separated)'
         required: false
         type: string
         default: ''
@@ -77,16 +72,6 @@ on:
         required: false
         type: string
         default: '27.5.1'
-      cache-type:
-        description: 'Cache backend: gha or registry'
-        required: false
-        type: string
-        default: 'gha'
-      cache-ref:
-        description: 'Registry ref for cache (when cache-type=registry)'
-        required: false
-        type: string
-        default: ''
       download-artifact:
         description: 'Artifact name to download before build (empty = skip)'
         required: false
@@ -119,40 +104,9 @@ on:
         required: false
 
 jobs:
-  validate-platforms:
-    name: Validate Build Configuration
-    runs-on: ubuntu-latest
-    env:
-      FULL_IMAGE_NAME: ${{ inputs.registry }}/${{ inputs.registry-org }}/${{ inputs.image-name }}
-    steps:
-      - name: Check multi-arch requirement
-        run: |
-          PLATFORMS="${{ inputs.platforms }}"
-          echo "## Build Configuration Validation" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Check if both architectures are included
-          if [[ "$PLATFORMS" == *"amd64"* ]] && [[ "$PLATFORMS" == *"arm64"* ]]; then
-            echo "✅ Multi-arch build configured: $PLATFORMS" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ WARNING: Single-arch build detected: $PLATFORMS" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Per POST-MORTEM-2026-01-22, all production containers MUST support both amd64 and arm64." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "If this is intentional (e.g., architecture-specific tooling), document the reason." >> $GITHUB_STEP_SUMMARY
-          fi
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
-          echo "- Image: ${{ env.FULL_IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Context: ${{ inputs.context }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Dockerfile: ${{ inputs.dockerfile }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Platforms: ${{ inputs.platforms }}" >> $GITHUB_STEP_SUMMARY
-
   build-and-push:
     name: Build and Push Container
     runs-on: ubuntu-latest
-    needs: [validate-platforms]
     permissions:
       contents: read
       packages: write
@@ -192,77 +146,99 @@ jobs:
           rm -rf /tmp/docker /tmp/docker.tgz
           docker version || echo "Docker CLI installed (daemon check may fail without socket)"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: ${{ inputs.platforms }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          buildkitd-config-inline: ${{ inputs.buildkitd-config }}
-
       - name: Log in to Container Registry
         if: inputs.push && github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ inputs.registry }}
-          username: ${{ secrets.registry-user || github.actor }}
-          password: ${{ secrets.registry-password || secrets.github-token || github.token }}
+        run: |
+          REGISTRY="${{ inputs.registry }}"
+          USER="${{ secrets.registry-user }}"
+          PASS="${{ secrets.registry-password }}"
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.FULL_IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
-            ${{ inputs.extra-tags }}
+          # Fall back to github actor/token if no explicit credentials
+          if [ -z "$USER" ]; then USER="${{ github.actor }}"; fi
+          if [ -z "$PASS" ]; then PASS="${{ secrets.github-token || github.token }}"; fi
+
+          echo "$PASS" | docker login "$REGISTRY" -u "$USER" --password-stdin
 
       - name: Compute immutable image tag
         id: sha
         run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build container image
         id: build
-        uses: docker/build-push-action@v5
-        with:
-          context: ${{ inputs.context }}
-          file: ${{ inputs.dockerfile }}
-          platforms: ${{ inputs.platforms }}
-          push: ${{ inputs.push && github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: ${{ inputs.cache-type == 'registry' && format('type=registry,ref={0}', inputs.cache-ref) || 'type=gha' }}
-          cache-to: ${{ inputs.cache-type == 'registry' && format('type=registry,ref={0},mode=max', inputs.cache-ref) || 'type=gha,mode=max' }}
+        run: |
+          TAG="${{ steps.sha.outputs.tag }}"
+          IMAGE="${{ env.FULL_IMAGE_NAME }}"
+          DOCKERFILE="${{ inputs.dockerfile }}"
 
-      - name: Verify multi-arch manifest
+          # Build all tags
+          TAG_FLAGS="-t ${IMAGE}:${TAG}"
+
+          # Add latest tag for default branch
+          if [ "${{ github.ref }}" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            TAG_FLAGS="$TAG_FLAGS -t ${IMAGE}:latest"
+          fi
+
+          # Add extra tags
+          EXTRA="${{ inputs.extra-tags }}"
+          for extra_tag in $EXTRA; do
+            TAG_FLAGS="$TAG_FLAGS -t ${IMAGE}:${extra_tag}"
+          done
+
+          echo "Building ${IMAGE}:${TAG} from ${DOCKERFILE}"
+          docker build $TAG_FLAGS -f "$DOCKERFILE" "${{ inputs.context }}"
+
+          # Capture all tags for output
+          ALL_TAGS="${IMAGE}:${TAG}"
+          if [ "${{ github.ref }}" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            ALL_TAGS="${ALL_TAGS}\n${IMAGE}:latest"
+          fi
+          for extra_tag in $EXTRA; do
+            ALL_TAGS="${ALL_TAGS}\n${IMAGE}:${extra_tag}"
+          done
+          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$ALL_TAGS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Push container image
         if: inputs.push && github.event_name != 'pull_request'
+        run: |
+          TAG="${{ steps.sha.outputs.tag }}"
+          IMAGE="${{ env.FULL_IMAGE_NAME }}"
+
+          echo "Pushing ${IMAGE}:${TAG}"
+          docker push "${IMAGE}:${TAG}"
+
+          # Push latest tag for default branch
+          if [ "${{ github.ref }}" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            echo "Pushing ${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          fi
+
+          # Push extra tags
+          EXTRA="${{ inputs.extra-tags }}"
+          for extra_tag in $EXTRA; do
+            echo "Pushing ${IMAGE}:${extra_tag}"
+            docker push "${IMAGE}:${extra_tag}"
+          done
+
+          # Get digest
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${TAG}" 2>/dev/null | cut -d@ -f2 || echo "")
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Summary
+        if: always()
         run: |
           echo "## Image Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Tags Pushed" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Verify manifest includes expected platforms
-          echo "### Platform Verification" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Verifying ${{ env.FULL_IMAGE_NAME }}:latest includes all platforms..." >> $GITHUB_STEP_SUMMARY
-
-          # Note: This verification runs after push, so manifest should be available
-          if docker manifest inspect ${{ env.FULL_IMAGE_NAME }}:latest > /dev/null 2>&1; then
-            echo "✅ Manifest accessible" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ Could not verify manifest (may require authentication)" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ${{ env.FULL_IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Tag: ${{ steps.sha.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Context: ${{ inputs.context }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Dockerfile: ${{ inputs.dockerfile }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Architecture: $(uname -m)" >> $GITHUB_STEP_SUMMARY
+          echo "- Push: ${{ inputs.push && github.event_name != 'pull_request' }}" >> $GITHUB_STEP_SUMMARY
 
     outputs:
       image-tag: ${{ steps.sha.outputs.tag }}
       image-digest: ${{ steps.build.outputs.digest }}
-      image-tags: ${{ steps.meta.outputs.tags }}
+      image-tags: ${{ steps.build.outputs.tags }}
