@@ -157,7 +157,22 @@ jobs:
           if [ -z "$USER" ]; then USER="${{ github.actor }}"; fi
           if [ -z "$PASS" ]; then PASS="${{ secrets.github-token || github.token }}"; fi
 
-          echo "$PASS" | docker login "$REGISTRY" -u "$USER" --password-stdin
+          # Write auth config directly — avoids `docker login` which does an
+          # HTTPS ping to the registry before authenticating. For HTTP-only
+          # internal registries (e.g., Gitea at gitea.infrastructure.svc:3000),
+          # docker login fails with "http: server gave HTTP response to HTTPS client".
+          # Writing the auth file directly bypasses this TLS verification.
+          AUTH=$(echo -n "${USER}:${PASS}" | base64)
+          mkdir -p ~/.docker
+          cat > ~/.docker/config.json << AUTHEOF
+          {
+            "auths": {
+              "${REGISTRY}": { "auth": "${AUTH}" },
+              "http://${REGISTRY}": { "auth": "${AUTH}" }
+            }
+          }
+          AUTHEOF
+          echo "Configured registry auth for ${REGISTRY}"
 
       - name: Compute immutable image tag
         id: sha
